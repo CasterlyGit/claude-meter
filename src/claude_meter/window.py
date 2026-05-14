@@ -30,21 +30,21 @@ from claude_meter.mac_window import make_always_visible
 
 
 class MeterWidget(QWidget):
-    SIZE = 140           # rings area
-    SIDE_PANEL = 110     # extra width to the LEFT for info readouts
+    # Widget dimensions — sized for legibility on non-Retina ultrawide
+    # monitors at 100% scaling. If you want the older compact look, halve
+    # SIZE and SIDE_PANEL and shrink each font by 3pt.
+    SIZE = 200           # rings area (was 140)
+    SIDE_PANEL = 160     # extra width to the LEFT for info readouts (was 110)
     WIDTH = SIZE + SIDE_PANEL
     HEIGHT = SIZE
     MARGIN_FROM_EDGE = 14
-    # Collapsed-dot mode: shrinks the widget to a tiny circle that still
-    # shows the 5h urgency hue. Click the chevron on the widget to toggle.
-    DOT_SIZE = 22
-    # Chevron button geometry (top-right corner when expanded).
-    CHEV_SIZE = 18
-    CHEV_MARGIN = 6
-    BASE_RING_THICKNESS = 9
-    MAX_RING_THICKNESS = 14
-    MIN_RING_THICKNESS = 6
-    RING_GAP = 3
+    DOT_SIZE = 28        # bigger so it's tappable on ultrawide (was 22)
+    CHEV_SIZE = 22
+    CHEV_MARGIN = 7
+    BASE_RING_THICKNESS = 13   # scaled up with SIZE
+    MAX_RING_THICKNESS = 18
+    MIN_RING_THICKNESS = 8
+    RING_GAP = 4
 
     # Burn-rate scale: 50k tokens/min = full comet tail.
     BURN_FULL_TAIL_TPM = 50_000
@@ -307,7 +307,7 @@ class MeterWidget(QWidget):
         # Feature 6: asymmetric thickness
         t5, tw = self._ring_thicknesses(frac5, fracw)
 
-        outer_inset = 14
+        outer_inset = 20  # scaled with SIZE
         outer_diam = self.SIZE - 2 * outer_inset
         outer_rect = (self._ring_origin_x + outer_inset, outer_inset, outer_diam, outer_diam)
 
@@ -385,7 +385,7 @@ class MeterWidget(QWidget):
         pct_text = f"{int(round(frac * 100))}%"
 
         big_font = QFont("Helvetica Neue")
-        big_font.setPointSize(8)
+        big_font.setPointSize(11)  # was 8
         big_font.setBold(True)
         painter.setFont(big_font)
         fm = painter.fontMetrics()
@@ -393,7 +393,7 @@ class MeterWidget(QWidget):
         ph = fm.ascent()
 
         # Pill background for legibility against fill
-        pad_x, pad_y = 4, 2
+        pad_x, pad_y = 6, 3
         pill_w = pw + pad_x * 2
         pill_h = ph + pad_y * 2
         px = int(tx - pill_w / 2)
@@ -565,15 +565,15 @@ class MeterWidget(QWidget):
         pace5 = self._pace_position(config.FIVE_HOUR_WINDOW)
         pacew = self._pace_position(config.WEEKLY_WINDOW)
 
-        # Geometry
-        x_lbl = 12
-        x_track = 12
-        track_w = self.SIDE_PANEL - 22
-        row_top = 18
-        row_h = 24
+        # Geometry — scaled up for legibility on non-Retina ultrawide.
+        x_lbl = 14
+        x_track = 14
+        track_w = self.SIDE_PANEL - 28
+        row_top = 26
+        row_h = 38
 
         label_font = QFont("Helvetica Neue")
-        label_font.setPointSize(7)
+        label_font.setPointSize(10)
         label_font.setBold(True)
 
         rows = [
@@ -586,17 +586,22 @@ class MeterWidget(QWidget):
         # Pulse drives the knob glow & breathing
         pulse = (math.sin(self._anim_phase) + 1) / 2  # 0..1
 
+        # Value-readout font (the "38%" sitting at the right end of each row)
+        value_font = QFont("Helvetica Neue")
+        value_font.setPointSize(10)
+        value_font.setBold(True)
+
         for i, (label, value, color) in enumerate(rows):
             y_lbl = row_top + i * row_h
-            y_track = y_lbl + 12
+            y_track = y_lbl + 16
 
             painter.setFont(label_font)
-            painter.setPen(QColor(255, 255, 255, 130))
+            painter.setPen(QColor(255, 255, 255, 210))  # was 130 — now legible
             painter.drawText(x_lbl, y_lbl, label.upper())
 
             # Track
-            track_pen = QPen(QColor(255, 255, 255, 35))
-            track_pen.setWidth(2)
+            track_pen = QPen(QColor(255, 255, 255, 55))
+            track_pen.setWidth(3)
             track_pen.setCapStyle(Qt.RoundCap)
             painter.setPen(track_pen)
             painter.drawLine(x_track, y_track, x_track + track_w, y_track)
@@ -605,13 +610,13 @@ class MeterWidget(QWidget):
 
             # Colored fill segment
             fill_pen = QPen(color)
-            fill_pen.setWidth(2)
+            fill_pen.setWidth(3)
             fill_pen.setCapStyle(Qt.RoundCap)
             painter.setPen(fill_pen)
             painter.drawLine(x_track, y_track, knob_x, y_track)
 
             # KNOB with breathing halo — always-on motion
-            halo_r = int(7 + pulse * 3)
+            halo_r = int(9 + pulse * 3)
             halo_color = QColor(color)
             halo_color.setAlpha(int(60 + pulse * 90))
             painter.setPen(Qt.NoPen)
@@ -623,7 +628,16 @@ class MeterWidget(QWidget):
                           min(color.green() + 30, 255),
                           min(color.blue() + 30, 255))
             painter.setBrush(bright)
-            painter.drawEllipse(knob_x - 4, y_track - 4, 8, 8)
+            painter.drawEllipse(knob_x - 5, y_track - 5, 10, 10)
+
+            # Value readout — small % at the right edge of the row, aligned
+            # with the label baseline so the row reads as one unit.
+            painter.setFont(value_font)
+            painter.setPen(bright)
+            pct_str = f"{int(round(min(value, 1.0) * 100))}%"
+            fm = painter.fontMetrics()
+            pw = fm.horizontalAdvance(pct_str)
+            painter.drawText(x_lbl + track_w - pw + 4, y_lbl, pct_str)
 
     def _draw_pace_marker(self, painter, rect_tuple, thickness, pace,
                           pulse_intensity=0.0):
@@ -703,13 +717,27 @@ class MeterWidget(QWidget):
             return
 
         # --- main filled arc up to min(frac, 1.0) ---
+        # IMPORTANT: trailing end is FlatCap so the rounded cap doesn't bulge
+        # backwards from 12 o'clock and look like a phantom 5-10% arc on the
+        # left side. Leading edge stays rounded for a clean head.
         fill_pen = QPen(color)
         fill_pen.setWidth(thickness)
-        fill_pen.setCapStyle(Qt.RoundCap)
+        fill_pen.setCapStyle(Qt.FlatCap)
         painter.setPen(fill_pen)
         start_angle = 90 * 16
         span = -int(frac * 360 * 16)
         painter.drawArc(x, y, w, h, start_angle, span)
+
+        # Round just the LEADING edge by drawing a tiny rounded cap at the
+        # tip. This gives the arc a clean head without the backward bulge.
+        if frac > 0.005:
+            cap_pen = QPen(color)
+            cap_pen.setWidth(thickness)
+            cap_pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(cap_pen)
+            painter.drawArc(x, y, w, h,
+                            int((90 - frac * 360) * 16),
+                            -8)  # half-degree nub at the leading edge
 
         # --- feature 3: comet tail ---
         # A second arc OVERLAID on the leading-edge portion, brighter & wider.
@@ -816,7 +844,7 @@ class MeterWidget(QWidget):
 
         # 1. Big number = time left in the 5h window (the actionable metric)
         big_font = QFont("Helvetica Neue")
-        big_font.setPointSize(17)
+        big_font.setPointSize(24)
         big_font.setBold(True)
         painter.setFont(big_font)
         painter.setPen(color5)
@@ -824,28 +852,28 @@ class MeterWidget(QWidget):
         fm = painter.fontMetrics()
         tw = fm.horizontalAdvance(win_left)
         th = fm.ascent()
-        painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 6), win_left)
+        painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 8), win_left)
 
-        # 2. Small label under the big number
+        # 2. Caption under the big number
         label_font = QFont("Helvetica Neue")
-        label_font.setPointSize(7)
+        label_font.setPointSize(9)
         painter.setFont(label_font)
-        painter.setPen(QColor(255, 255, 255, 130))
+        painter.setPen(QColor(255, 255, 255, 180))  # was 130
         lbl = "5h window left"
         fm = painter.fontMetrics()
         lw = fm.horizontalAdvance(lbl)
-        painter.drawText(int(cx - lw / 2), int(cy + th / 2 + 4), lbl)
+        painter.drawText(int(cx - lw / 2), int(cy + th / 2 + 8), lbl)
 
         # 3. Verdict word at the bottom of the center
         verdict_font = QFont("Helvetica Neue")
-        verdict_font.setPointSize(8)
+        verdict_font.setPointSize(11)
         verdict_font.setBold(True)
         painter.setFont(verdict_font)
         painter.setPen(color5)
         word = self._verdict_word(delta5)
         fm = painter.fontMetrics()
         vw = fm.horizontalAdvance(word)
-        painter.drawText(int(cx - vw / 2), int(cy + th / 2 + 18), word)
+        painter.drawText(int(cx - vw / 2), int(cy + th / 2 + 28), word)
 
 
 def main() -> int:
