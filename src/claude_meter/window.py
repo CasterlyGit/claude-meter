@@ -28,7 +28,10 @@ from claude_meter.mac_window import make_always_visible
 
 
 class MeterWidget(QWidget):
-    SIZE = 140
+    SIZE = 140           # rings area
+    SIDE_PANEL = 110     # extra width to the LEFT for info readouts
+    WIDTH = SIZE + SIDE_PANEL
+    HEIGHT = SIZE
     MARGIN_FROM_EDGE = 14
     BASE_RING_THICKNESS = 9
     MAX_RING_THICKNESS = 14
@@ -45,7 +48,7 @@ class MeterWidget(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
 
         self._five_hour: counter.WindowStats | None = None
         self._weekly: counter.WindowStats | None = None
@@ -78,7 +81,7 @@ class MeterWidget(QWidget):
         screens = app.screens()
         target = max(screens, key=lambda s: s.geometry().x())
         geo = target.availableGeometry()
-        x = geo.right() - self.SIZE - self.MARGIN_FROM_EDGE
+        x = geo.right() - self.WIDTH - self.MARGIN_FROM_EDGE
         y = geo.top() + self.MARGIN_FROM_EDGE
         self.move(x, y)
 
@@ -226,10 +229,14 @@ class MeterWidget(QWidget):
         painter.setBrush(QColor(15, 17, 22, 235))
         painter.drawRoundedRect(rect, 18, 18)
 
+        # The rings are drawn anchored to the right of the card; the left
+        # SIDE_PANEL pixels are reserved for the info panel. Shift all ring
+        # geometry by +SIDE_PANEL so the rings sit on the right.
+        self._ring_origin_x = self.SIDE_PANEL
+
         if self._five_hour is None or self._weekly is None:
             return
 
-        # Real data only. No fallback estimates.
         official5 = self._official_pct("five_hour")
         officialw = self._official_pct("seven_day")
         if official5 is None or officialw is None:
@@ -246,12 +253,12 @@ class MeterWidget(QWidget):
 
         outer_inset = 14
         outer_diam = self.SIZE - 2 * outer_inset
-        outer_rect = (outer_inset, outer_inset, outer_diam, outer_diam)
+        outer_rect = (self._ring_origin_x + outer_inset, outer_inset, outer_diam, outer_diam)
 
         # Inner inset depends on outer thickness
         inner_inset = outer_inset + t5 + self.RING_GAP
         inner_diam = self.SIZE - 2 * inner_inset
-        inner_rect = (inner_inset, inner_inset, inner_diam, inner_diam)
+        inner_rect = (self._ring_origin_x + inner_inset, inner_inset, inner_diam, inner_diam)
 
         pace5 = self._pace_position(config.FIVE_HOUR_WINDOW)
         pacew = self._pace_position(config.WEEKLY_WINDOW)
@@ -275,16 +282,14 @@ class MeterWidget(QWidget):
             burn_tpm=0.0,
         )
 
-        # Draw the pace markers ON TOP of the fill arcs — radial spokes
-        # that stick out past the ring so they're visible regardless of
-        # where the fill currently ends. Pulse intensity scales with how
-        # far past the marker the fill is (overpacing strength).
-        pulse5 = max(0.0, min(delta5 * 2.0, 1.0))  # 50% delta = full pulse
+        # Draw the pace markers ON TOP of the fill arcs.
+        pulse5 = max(0.0, min(delta5 * 2.0, 1.0))
         pulsew = max(0.0, min(deltaw * 2.0, 1.0))
         self._draw_pace_marker(painter, outer_rect, t5, pace5, pulse5)
         self._draw_pace_marker(painter, inner_rect, tw, pacew, pulsew)
 
         self._draw_center_text(painter, frac5, fracw, delta5, deltaw)
+        self._draw_side_panel(painter, frac5, fracw, delta5, deltaw)
 
     def _draw_waiting_state(self, painter):
         """Render when no live rate-limit data is available.
@@ -292,7 +297,7 @@ class MeterWidget(QWidget):
         Draws empty ring outlines and a small 'waiting' message in the center.
         No estimates, no guessed numbers — the user asked for real data only.
         """
-        cx = self.SIZE / 2
+        cx = self.SIDE_PANEL + self.SIZE / 2
         cy = self.SIZE / 2
 
         outer_inset = 14
@@ -302,9 +307,10 @@ class MeterWidget(QWidget):
 
         # Two faint ring outlines + a slow synthwave-cyan sweep so the
         # waiting state feels alive, not broken
+        ox = self.SIDE_PANEL
         for idx, (rect_tuple, thickness) in enumerate([
-            ((outer_inset, outer_inset, outer_diam, outer_diam), self.BASE_RING_THICKNESS),
-            ((inner_inset, inner_inset, inner_diam, inner_diam), self.BASE_RING_THICKNESS),
+            ((ox + outer_inset, outer_inset, outer_diam, outer_diam), self.BASE_RING_THICKNESS),
+            ((ox + inner_inset, inner_inset, inner_diam, inner_diam), self.BASE_RING_THICKNESS),
         ]):
             x, y, w, h = rect_tuple
             pen = QPen(QColor(255, 255, 255, 20))
@@ -345,6 +351,71 @@ class MeterWidget(QWidget):
         sub2 = "open a claude session"
         sw2 = fm.horizontalAdvance(sub2)
         painter.drawText(int(cx - sw2 / 2), int(cy + 22), sub2)
+
+    def _time_until_reset(self, key: str) -> str:
+        """Compute 'time until window resets' from resets_at timestamp."""
+        from datetime import datetime, timezone
+        rl = (self._official or {}).get("rate_limits") or {}
+        block = rl.get(key) or {}
+        ts = block.get("resets_at")
+        if ts is None:
+            return "—"
+        # Can be unix seconds (int) or ISO8601 string
+        try:
+            if isinstance(ts, (int, float)):
+                reset_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            else:
+                reset_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except Exception:
+            return "—"
+        delta = reset_dt - datetime.now(timezone.utc)
+        secs = int(delta.total_seconds())
+        if secs <= 0:
+            return "now"
+        if secs < 3600:
+            return f"{secs // 60}m"
+        if secs < 86400:
+            h = secs // 3600
+            m = (secs % 3600) // 60
+            return f"{h}h {m}m" if m else f"{h}h"
+        d = secs // 86400
+        h = (secs % 86400) // 3600
+        return f"{d}d {h}h" if h else f"{d}d"
+
+    def _draw_side_panel(self, painter, frac5, fracw, delta5, deltaw):
+        """Left-side info panel with extended dimensions of data."""
+        x = 14
+        y = 18
+        line_h = 22
+
+        title_font = QFont("Helvetica Neue")
+        title_font.setPointSize(7)
+        title_font.setBold(True)
+        val_font = QFont("Helvetica Neue")
+        val_font.setPointSize(11)
+        val_font.setBold(True)
+
+        def row(label, value, color):
+            painter.setFont(title_font)
+            painter.setPen(QColor(255, 255, 255, 110))
+            painter.drawText(x, y - 1, label.upper())
+            painter.setFont(val_font)
+            painter.setPen(color)
+            painter.drawText(x, y + 12, value)
+
+        c5 = self._verdict_color(delta5, "5h")
+        cw = self._verdict_color(deltaw, "weekly")
+
+        # 5h: percentage + time until reset
+        row("5h used", f"{int(round(frac5 * 100))}%", c5)
+        y += line_h
+        row("5h resets in", self._time_until_reset("five_hour"), QColor(220, 220, 230, 220))
+        y += line_h
+
+        # weekly
+        row("week used", f"{int(round(fracw * 100))}%", cw)
+        y += line_h
+        row("week resets", self._time_until_reset("seven_day"), QColor(220, 220, 230, 220))
 
     def _draw_pace_marker(self, painter, rect_tuple, thickness, pace,
                           pulse_intensity=0.0):
@@ -528,7 +599,7 @@ class MeterWidget(QWidget):
         return "REST EASY"
 
     def _draw_center_text(self, painter, frac5, fracw, delta5, deltaw):
-        cx = self.SIZE / 2
+        cx = self.SIDE_PANEL + self.SIZE / 2
         cy = self.SIZE / 2
 
         color5 = self._verdict_color(delta5, "5h")
