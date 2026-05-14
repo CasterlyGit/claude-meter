@@ -208,15 +208,8 @@ class MeterWidget(QWidget):
     # ---- ring thickness from relative pressure ----
 
     def _ring_thicknesses(self, frac5: float, fracw: float) -> tuple[int, int]:
-        """Heavier-loaded ring gets more visual mass."""
-        total = max(frac5 + fracw, 0.001)
-        share5 = frac5 / total
-        sharew = fracw / total
-        # Map shares 0..1 → thickness MIN..MAX, centered at BASE
-        spread = self.MAX_RING_THICKNESS - self.MIN_RING_THICKNESS
-        t5 = int(self.MIN_RING_THICKNESS + spread * share5)
-        tw = int(self.MIN_RING_THICKNESS + spread * sharew)
-        return t5, tw
+        """Both rings use base thickness — keeps the visual consistent."""
+        return self.BASE_RING_THICKNESS, self.BASE_RING_THICKNESS
 
     # ---- painting ----
 
@@ -383,39 +376,76 @@ class MeterWidget(QWidget):
         return f"{d}d {h}h" if h else f"{d}d"
 
     def _draw_side_panel(self, painter, frac5, fracw, delta5, deltaw):
-        """Left-side info panel with extended dimensions of data."""
-        x = 14
-        y = 18
-        line_h = 22
+        """Left-side info panel: slider-style horizontal lines, one per dim.
 
-        title_font = QFont("Helvetica Neue")
-        title_font.setPointSize(7)
-        title_font.setBold(True)
-        val_font = QFont("Helvetica Neue")
-        val_font.setPointSize(11)
-        val_font.setBold(True)
-
-        def row(label, value, color):
-            painter.setFont(title_font)
-            painter.setPen(QColor(255, 255, 255, 110))
-            painter.drawText(x, y - 1, label.upper())
-            painter.setFont(val_font)
-            painter.setPen(color)
-            painter.drawText(x, y + 12, value)
-
+        Four rows: 5h used, time elapsed in 5h, week used, time elapsed in week.
+        Each row: small label, a faint track line, a colored glowing knob at
+        the position. Matches the slider aesthetic from the docs demo.
+        """
         c5 = self._verdict_color(delta5, "5h")
         cw = self._verdict_color(deltaw, "weekly")
+        pace5 = self._pace_position(config.FIVE_HOUR_WINDOW)
+        pacew = self._pace_position(config.WEEKLY_WINDOW)
 
-        # 5h: percentage + time until reset
-        row("5h used", f"{int(round(frac5 * 100))}%", c5)
-        y += line_h
-        row("5h resets in", self._time_until_reset("five_hour"), QColor(220, 220, 230, 220))
-        y += line_h
+        # Geometry
+        x_lbl = 12
+        x_track = 12
+        track_w = self.SIDE_PANEL - 22
+        row_top = 18
+        row_h = 24
 
-        # weekly
-        row("week used", f"{int(round(fracw * 100))}%", cw)
-        y += line_h
-        row("week resets", self._time_until_reset("seven_day"), QColor(220, 220, 230, 220))
+        label_font = QFont("Helvetica Neue")
+        label_font.setPointSize(7)
+        label_font.setBold(True)
+
+        rows = [
+            ("5h used",     frac5,  c5),
+            ("5h elapsed",  pace5,  QColor(180, 180, 200, 220)),
+            ("week used",   fracw,  cw),
+            ("week elap.",  pacew,  QColor(180, 180, 200, 220)),
+        ]
+
+        # Pulse drives the knob glow & breathing
+        pulse = (math.sin(self._anim_phase) + 1) / 2  # 0..1
+
+        for i, (label, value, color) in enumerate(rows):
+            y_lbl = row_top + i * row_h
+            y_track = y_lbl + 12
+
+            painter.setFont(label_font)
+            painter.setPen(QColor(255, 255, 255, 130))
+            painter.drawText(x_lbl, y_lbl, label.upper())
+
+            # Track
+            track_pen = QPen(QColor(255, 255, 255, 35))
+            track_pen.setWidth(2)
+            track_pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(track_pen)
+            painter.drawLine(x_track, y_track, x_track + track_w, y_track)
+
+            knob_x = int(x_track + min(value, 1.0) * track_w)
+
+            # Colored fill segment
+            fill_pen = QPen(color)
+            fill_pen.setWidth(2)
+            fill_pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(fill_pen)
+            painter.drawLine(x_track, y_track, knob_x, y_track)
+
+            # KNOB with breathing halo — always-on motion
+            halo_r = int(7 + pulse * 3)
+            halo_color = QColor(color)
+            halo_color.setAlpha(int(60 + pulse * 90))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(halo_color)
+            painter.drawEllipse(knob_x - halo_r, y_track - halo_r, halo_r * 2, halo_r * 2)
+            # Solid bright center
+            bright = QColor(color)
+            bright.setRgb(min(color.red() + 30, 255),
+                          min(color.green() + 30, 255),
+                          min(color.blue() + 30, 255))
+            painter.setBrush(bright)
+            painter.drawEllipse(knob_x - 4, y_track - 4, 8, 8)
 
     def _draw_pace_marker(self, painter, rect_tuple, thickness, pace,
                           pulse_intensity=0.0):
