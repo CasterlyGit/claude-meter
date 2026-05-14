@@ -342,29 +342,110 @@ class MeterWidget(QWidget):
                 int(overflow_span_deg * 16),
             )
 
+    def _time_until_cap(self, stats, ceiling: int, burn_tpm: float) -> str:
+        """How long until we hit the ceiling at current burn rate.
+
+        Returns a short string like "1h 12m" or "8m" or "—" for idle.
+        """
+        remaining = max(ceiling - stats.billed_tokens, 0)
+        if burn_tpm <= 0 or remaining <= 0:
+            return "—"
+        minutes = remaining / burn_tpm
+        if minutes < 1:
+            return "<1m"
+        if minutes < 60:
+            return f"{int(round(minutes))}m"
+        h = int(minutes // 60)
+        m = int(round(minutes % 60))
+        if m == 0:
+            return f"{h}h"
+        return f"{h}h {m}m"
+
+    def _window_time_left(self, stats, window_hours: float) -> str:
+        """Time remaining in the rolling window before old samples age out.
+
+        For a 5-hour rolling window, this is (5h - age_of_earliest_sample).
+        """
+        if stats is None or stats.earliest is None:
+            return f"{int(window_hours)}h"
+        now = counter.now_utc()
+        elapsed = (now - stats.earliest).total_seconds() / 60.0  # min
+        total = window_hours * 60.0
+        left = max(total - elapsed, 0)
+        if left < 60:
+            return f"{int(round(left))}m"
+        h = int(left // 60)
+        m = int(round(left % 60))
+        if m == 0:
+            return f"{h}h"
+        return f"{h}h {m}m"
+
+    def _verdict_word(self, delta: float) -> str:
+        """One-word answer to 'should I slow down?'.
+
+        Matches the color stops so the word and the hue agree.
+        """
+        if delta >= 0.30:
+            return "STOP"
+        if delta >= 0.15:
+            return "SLOW"
+        if delta >= 0.05:
+            return "EASE"
+        if delta >= -0.05:
+            return "ON PACE"
+        if delta >= -0.15:
+            return "FINE"
+        return "REST EASY"
+
     def _draw_center_text(self, painter, frac5, fracw, delta5, deltaw):
         cx = self.SIZE / 2
         cy = self.SIZE / 2
 
+        limits = config.active_limit()
+
+        # 1. Verdict word at the top — at-a-glance answer
+        verdict_font = QFont("Helvetica Neue")
+        verdict_font.setPointSize(8)
+        verdict_font.setBold(True)
+        painter.setFont(verdict_font)
+        painter.setPen(self._pace_color(delta5, "5h"))
+        word = self._verdict_word(delta5)
+        fm = painter.fontMetrics()
+        vw = fm.horizontalAdvance(word)
+        painter.drawText(int(cx - vw / 2), int(cy - 24), word)
+
+        # 2. Big number = time until you hit the 5h cap at current burn rate
         big_font = QFont("Helvetica Neue")
-        big_font.setPointSize(19)
+        big_font.setPointSize(15)
         big_font.setBold(True)
         painter.setFont(big_font)
         painter.setPen(self._pace_color(delta5, "5h"))
-        text = f"{int(round(frac5 * 100))}"
+        cap_text = self._time_until_cap(self._five_hour, limits.five_hour_ceiling, self._burn_tpm)
         fm = painter.fontMetrics()
-        tw = fm.horizontalAdvance(text)
+        tw = fm.horizontalAdvance(cap_text)
         th = fm.ascent()
-        painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 2), text)
+        painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 4), cap_text)
 
-        sub_font = QFont("Helvetica Neue")
-        sub_font.setPointSize(8)
-        painter.setFont(sub_font)
-        painter.setPen(self._pace_color(deltaw, "weekly"))
-        wk_text = f"wk·{int(round(fracw * 100))}"
+        # "until cap" small label under the big number
+        label_font = QFont("Helvetica Neue")
+        label_font.setPointSize(7)
+        painter.setFont(label_font)
+        painter.setPen(QColor(255, 255, 255, 110))
+        lbl = "until cap"
         fm = painter.fontMetrics()
-        ww = fm.horizontalAdvance(wk_text)
-        painter.drawText(int(cx - ww / 2), int(cy + th / 2 + 10), wk_text)
+        lw = fm.horizontalAdvance(lbl)
+        painter.drawText(int(cx - lw / 2), int(cy + th / 2 + 6), lbl)
+
+        # 3. Bottom line: window time left + weekly %
+        sub_font = QFont("Helvetica Neue")
+        sub_font.setPointSize(7)
+        painter.setFont(sub_font)
+        painter.setPen(QColor(255, 255, 255, 150))
+        win_left = self._window_time_left(self._five_hour, config.FIVE_HOUR_WINDOW)
+        bottom = f"{win_left} left · wk {int(round(fracw * 100))}"
+        fm = painter.fontMetrics()
+        bw = fm.horizontalAdvance(bottom)
+        painter.drawText(int(cx - bw / 2), int(cy + th / 2 + 18), bottom)
 
 
 def main() -> int:
