@@ -321,10 +321,13 @@ class MeterWidget(QWidget):
         delta5 = self._pace_delta(frac5, pace5)
         deltaw = self._pace_delta(fracw, pacew)
 
+        color5_q = self._verdict_color(delta5, "5h")
+        colorw_q = self._verdict_color(deltaw, "weekly")
+
         self._draw_loaded_ring(
             painter, outer_rect, t5,
             frac=frac5, raw_frac=raw5,
-            color=self._verdict_color(delta5, "5h"),
+            color=color5_q,
             pace=pace5,
             time_pressure=self._time_pressure(config.FIVE_HOUR_WINDOW),
             burn_tpm=self._burn_tpm,
@@ -332,7 +335,7 @@ class MeterWidget(QWidget):
         self._draw_loaded_ring(
             painter, inner_rect, tw,
             frac=fracw, raw_frac=raww,
-            color=self._verdict_color(deltaw, "weekly"),
+            color=colorw_q,
             pace=pacew,
             time_pressure=self._time_pressure(config.WEEKLY_WINDOW),
             burn_tpm=0.0,
@@ -344,9 +347,67 @@ class MeterWidget(QWidget):
         self._draw_pace_marker(painter, outer_rect, t5, pace5, pulse5)
         self._draw_pace_marker(painter, inner_rect, tw, pacew, pulsew)
 
+        # Percent badges on each ring (color-matched, near leading edge).
+        self._draw_ring_pct(painter, outer_rect, frac5, color5_q, label="5h")
+        self._draw_ring_pct(painter, inner_rect, fracw, colorw_q, label="wk")
+
         self._draw_center_text(painter, frac5, fracw, delta5, deltaw)
         self._draw_side_panel(painter, frac5, fracw, delta5, deltaw)
         self._draw_collapse_chevron(painter)
+
+    def _draw_ring_pct(self, painter, rect_tuple, frac, color, label):
+        """Small color-matched percentage label sitting just inside the leading
+        edge of the arc. Compact (e.g. '38%') with a tiny scope label
+        ('5h' or 'wk') stacked underneath at half size.
+
+        Placement: at the top of the ring (12 o'clock) for the outer ring and
+        at the bottom (6 o'clock) for the inner ring — keeps them from
+        colliding with the center text and with each other.
+        """
+        x, y, w, h = rect_tuple
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+
+        # Outer ring => sits just outside the top, inner ring => below center
+        is_outer = (label == "5h")
+        if is_outer:
+            # Above the ring, slightly outside it. Hidden by the center stack
+            # if it overlaps, so keep it small.
+            tx = cx
+            ty = y - 2
+            anchor_top = True
+        else:
+            # Place inside the ring, below center, ABOVE the inner ring's track.
+            tx = cx
+            ty = y + h + 12
+            anchor_top = False
+
+        pct_text = f"{int(round(frac * 100))}%"
+
+        big_font = QFont("Helvetica Neue")
+        big_font.setPointSize(8)
+        big_font.setBold(True)
+        painter.setFont(big_font)
+        fm = painter.fontMetrics()
+        pw = fm.horizontalAdvance(pct_text)
+        ph = fm.ascent()
+
+        # Pill background for legibility against fill
+        pad_x, pad_y = 4, 2
+        pill_w = pw + pad_x * 2
+        pill_h = ph + pad_y * 2
+        px = int(tx - pill_w / 2)
+        py = int(ty - (pill_h if anchor_top else 0))
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(15, 17, 22, 220))
+        painter.drawRoundedRect(px, py, pill_w, pill_h, 6, 6)
+
+        # Color-matched percent text
+        painter.setPen(color)
+        painter.drawText(int(tx - pw / 2),
+                         int(py + pad_y + ph - 1),
+                         pct_text)
 
     def _draw_collapse_chevron(self, painter):
         """Small clickable chevron in the top-right of the expanded widget.
@@ -623,11 +684,13 @@ class MeterWidget(QWidget):
     ):
         x, y, w, h = rect_tuple
 
-        # --- track (feature 2: opacity = time pressure) ---
-        # Idle: 20 alpha. Wound-down: 70 alpha.
-        track_alpha = int(20 + 50 * time_pressure)
+        # --- track ---
+        # Very faint neutral grey. Was previously hued + tied to "time pressure"
+        # which made the unfilled portion read like a phantom data arc on darker
+        # palettes. Now it's purely a hairline rail.
+        track_alpha = int(14 + 14 * time_pressure)  # 14..28 max
         track_pen = QPen(QColor(255, 255, 255, track_alpha))
-        track_pen.setWidth(thickness)
+        track_pen.setWidth(max(2, thickness - 4))   # thinner than the fill
         track_pen.setCapStyle(Qt.RoundCap)
         painter.setPen(track_pen)
         painter.drawArc(x, y, w, h, 0, 360 * 16)
@@ -751,7 +814,29 @@ class MeterWidget(QWidget):
 
         color5 = self._verdict_color(delta5, "5h")
 
-        # 1. Verdict word at the top
+        # 1. Big number = time left in the 5h window (the actionable metric)
+        big_font = QFont("Helvetica Neue")
+        big_font.setPointSize(17)
+        big_font.setBold(True)
+        painter.setFont(big_font)
+        painter.setPen(color5)
+        win_left = self._window_time_left(self._five_hour, config.FIVE_HOUR_WINDOW)
+        fm = painter.fontMetrics()
+        tw = fm.horizontalAdvance(win_left)
+        th = fm.ascent()
+        painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 6), win_left)
+
+        # 2. Small label under the big number
+        label_font = QFont("Helvetica Neue")
+        label_font.setPointSize(7)
+        painter.setFont(label_font)
+        painter.setPen(QColor(255, 255, 255, 130))
+        lbl = "5h window left"
+        fm = painter.fontMetrics()
+        lw = fm.horizontalAdvance(lbl)
+        painter.drawText(int(cx - lw / 2), int(cy + th / 2 + 4), lbl)
+
+        # 3. Verdict word at the bottom of the center
         verdict_font = QFont("Helvetica Neue")
         verdict_font.setPointSize(8)
         verdict_font.setBold(True)
@@ -760,39 +845,7 @@ class MeterWidget(QWidget):
         word = self._verdict_word(delta5)
         fm = painter.fontMetrics()
         vw = fm.horizontalAdvance(word)
-        painter.drawText(int(cx - vw / 2), int(cy - 24), word)
-
-        # 2. Big number = time left in the 5h window (always meaningful)
-        big_font = QFont("Helvetica Neue")
-        big_font.setPointSize(15)
-        big_font.setBold(True)
-        painter.setFont(big_font)
-        painter.setPen(color5)
-        win_left = self._window_time_left(self._five_hour, config.FIVE_HOUR_WINDOW)
-        fm = painter.fontMetrics()
-        tw = fm.horizontalAdvance(win_left)
-        th = fm.ascent()
-        painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 4), win_left)
-
-        # Small label under the big number
-        label_font = QFont("Helvetica Neue")
-        label_font.setPointSize(7)
-        painter.setFont(label_font)
-        painter.setPen(QColor(255, 255, 255, 110))
-        lbl = "5h window left"
-        fm = painter.fontMetrics()
-        lw = fm.horizontalAdvance(lbl)
-        painter.drawText(int(cx - lw / 2), int(cy + th / 2 + 6), lbl)
-
-        # 3. Bottom line: 5h % · weekly %
-        sub_font = QFont("Helvetica Neue")
-        sub_font.setPointSize(7)
-        painter.setFont(sub_font)
-        painter.setPen(QColor(255, 255, 255, 150))
-        bottom = f"{int(round(frac5 * 100))}%  ·  wk {int(round(fracw * 100))}%"
-        fm = painter.fontMetrics()
-        bw = fm.horizontalAdvance(bottom)
-        painter.drawText(int(cx - bw / 2), int(cy + th / 2 + 18), bottom)
+        painter.drawText(int(cx - vw / 2), int(cy + th / 2 + 18), word)
 
 
 def main() -> int:
