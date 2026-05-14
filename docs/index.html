@@ -33,102 +33,28 @@
   main {
     max-width: 880px;
     margin: 0 auto;
-    padding: 0 24px 96px;
+    padding: 56px 24px 96px;
   }
-  /* HERO — fills the top of the screen with the meter as the focal image */
-  .hero {
-    min-height: min(92vh, 740px);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 60px 0 40px;
-    position: relative;
-  }
-  .hero-tag {
-    color: var(--fg-dim);
-    font-family: "SF Mono", ui-monospace, monospace;
-    font-size: 12px;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    margin-bottom: 36px;
-  }
-  .hero-meter {
-    width: min(520px, 78vw);
-    aspect-ratio: 1;
-    position: relative;
-    margin-bottom: 36px;
-    filter: drop-shadow(0 10px 60px rgba(110, 90, 230, 0.35))
-            drop-shadow(0 0 40px rgba(0, 240, 255, 0.15));
-  }
-  .hero-meter svg {
-    width: 100%;
-    height: 100%;
-  }
-  .hero h1 {
+  h1 {
     font-family: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
-    font-size: clamp(28px, 4.4vw, 44px);
+    font-size: 28px;
     font-weight: 700;
-    margin: 0 0 14px;
+    margin: 0 0 4px;
     letter-spacing: -0.02em;
-    text-align: center;
-    max-width: 720px;
   }
-  .hero-sub {
-    font-size: clamp(15px, 1.7vw, 18px);
-    line-height: 1.55;
-    max-width: 580px;
-    margin: 0 0 28px;
+  .tag {
     color: var(--fg-dim);
-    text-align: center;
-  }
-  .hero-cta {
-    display: flex;
-    gap: 16px;
     font-family: "SF Mono", ui-monospace, monospace;
     font-size: 12px;
-    letter-spacing: 0.12em;
+    letter-spacing: 0.1em;
     text-transform: uppercase;
   }
-  .hero-cta a {
+  .lede {
+    font-size: 17px;
+    line-height: 1.55;
+    max-width: 620px;
+    margin: 18px 0 36px;
     color: var(--fg);
-    text-decoration: none;
-    padding: 10px 18px;
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    border-radius: 8px;
-    transition: all 0.2s;
-  }
-  .hero-cta a:hover {
-    border-color: rgba(110, 90, 230, 0.6);
-    background: rgba(110, 90, 230, 0.08);
-  }
-  .hero-cta a.primary {
-    background: linear-gradient(135deg, rgba(110, 90, 230, 0.25), rgba(0, 240, 255, 0.18));
-    border-color: rgba(110, 90, 230, 0.5);
-  }
-  .scroll-cue {
-    position: absolute;
-    bottom: 16px;
-    left: 50%;
-    transform: translateX(-50%);
-    color: var(--fg-faint);
-    font-family: "SF Mono", ui-monospace, monospace;
-    font-size: 10px;
-    letter-spacing: 0.2em;
-    animation: bob 2.5s ease-in-out infinite;
-  }
-  @keyframes bob {
-    0%, 100% { transform: translateX(-50%) translateY(0); opacity: 0.4; }
-    50%      { transform: translateX(-50%) translateY(6px); opacity: 0.8; }
-  }
-  h2.section-title {
-    font-family: "SF Mono", ui-monospace, monospace;
-    font-size: 14px;
-    font-weight: 600;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--fg-dim);
-    margin: 64px 0 24px;
   }
   .stage {
     display: grid;
@@ -281,53 +207,16 @@
 </head>
 <body>
 <main>
-  <section class="hero">
-    <span class="hero-tag">claude · meter</span>
-    <div class="hero-meter">
-      <svg viewBox="0 0 200 200" id="hero-meter-svg">
-        <defs>
-          <filter id="bigglow" x="-50%" y="-50%" width="200%" height="200%">
-            <feGaussianBlur stdDeviation="4" result="blur"/>
-            <feMerge>
-              <feMergeNode in="blur"/>
-              <feMergeNode in="SourceGraphic"/>
-            </feMerge>
-          </filter>
-          <radialGradient id="cardgrad" cx="50%" cy="40%" r="60%">
-            <stop offset="0%" stop-color="rgba(30,32,52,0.95)"/>
-            <stop offset="100%" stop-color="rgba(15,17,26,0.95)"/>
-          </radialGradient>
-        </defs>
-        <rect x="6" y="6" width="188" height="188" rx="22" fill="url(#cardgrad)" stroke="rgba(255,255,255,0.08)" stroke-width="1"/>
-        <!-- outer ring track -->
-        <circle cx="100" cy="100" r="80" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="11"/>
-        <!-- outer fill (animated by JS) -->
-        <circle cx="100" cy="100" r="80" fill="none" stroke="#9d82ff" stroke-width="11"
-                stroke-linecap="round" stroke-dasharray="0 999" transform="rotate(-90 100 100)" id="hero-outer" filter="url(#bigglow)"/>
-        <line x1="100" y1="14" x2="100" y2="2" stroke="white" stroke-width="2.5" id="hero-outer-spoke"/>
-        <!-- inner ring -->
-        <circle cx="100" cy="100" r="58" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="9"/>
-        <circle cx="100" cy="100" r="58" fill="none" stroke="#a4a8ff" stroke-width="9"
-                stroke-linecap="round" stroke-dasharray="0 999" transform="rotate(-90 100 100)" id="hero-inner" filter="url(#bigglow)"/>
-        <line x1="100" y1="36" x2="100" y2="24" stroke="white" stroke-width="2.5" id="hero-inner-spoke"/>
-        <!-- center text -->
-        <text x="100" y="86" text-anchor="middle" font-family="SF Mono, ui-monospace, monospace" font-size="9" font-weight="700" fill="#9d82ff" letter-spacing="1" id="hero-verdict">SLOW</text>
-        <text x="100" y="110" text-anchor="middle" font-family="Helvetica Neue, sans-serif" font-size="22" font-weight="700" fill="#9d82ff" id="hero-bignum">1h 4m</text>
-        <text x="100" y="121" text-anchor="middle" font-family="Helvetica Neue, sans-serif" font-size="7" fill="rgba(255,255,255,0.5)">5h window left</text>
-        <text x="100" y="138" text-anchor="middle" font-family="Helvetica Neue, sans-serif" font-size="7" fill="rgba(255,255,255,0.5)" id="hero-footer">98%  ·  wk 8%</text>
-      </svg>
-    </div>
-    <h1>One glance. Should I slow down?</h1>
-    <p class="hero-sub">A pinned overlay for the corner of your screen, mirroring Claude Code's own <code>/usage</code> gauges. The rings, color, and pace marker answer the question without you having to read a number.</p>
-    <div class="hero-cta">
-      <a href="https://github.com/CasterlyGit/claude-meter" class="primary">Get on GitHub →</a>
-      <a href="#tinker">Try it below</a>
-    </div>
-    <div class="scroll-cue">scroll · tinker</div>
-  </section>
+  <span class="tag">claude · meter</span>
+  <h1>Two rings on the corner of your screen.</h1>
+  <p class="lede">
+    A pinned overlay that mirrors Claude Code's own <code>/usage</code> gauges
+    — the 5-hour and 7-day rolling windows. The fill shows what you've spent.
+    The bright spoke on the track shows where a fair pace would put you right
+    now. The color answers <em>am I burning faster than my budget?</em>
+  </p>
 
-  <h2 class="section-title">Tinker with the meter</h2>
-  <section class="stage" id="tinker">
+  <section class="stage">
     <div class="meter-wrap">
       <svg viewBox="0 0 200 200" id="meter">
         <defs>
@@ -548,57 +437,6 @@ claude-meter <span class="c"># overlay appears top-right of your rightmost displ
     el(id).addEventListener("input", update);
   });
   update();
-
-  // --- Hero meter: gentle live demo so the page feels alive ---
-  const HERO_OUTER_R = 80;
-  const HERO_INNER_R = 58;
-  const HERO_OUTER_C = 2 * Math.PI * HERO_OUTER_R;
-  const HERO_INNER_C = 2 * Math.PI * HERO_INNER_R;
-
-  function heroSpoke(elId, r, pacePct, half) {
-    const ang = (pacePct / 100) * 2 * Math.PI - Math.PI / 2;
-    const x1 = 100 + Math.cos(ang) * (r - half);
-    const y1 = 100 + Math.sin(ang) * (r - half);
-    const x2 = 100 + Math.cos(ang) * (r + half);
-    const y2 = 100 + Math.sin(ang) * (r + half);
-    const n = document.getElementById(elId);
-    n.setAttribute("x1", x1); n.setAttribute("y1", y1);
-    n.setAttribute("x2", x2); n.setAttribute("y2", y2);
-  }
-
-  function heroTick(t) {
-    // Cycle through a gentle "you're burning a bit fast" story over 12s,
-    // landing on the realistic state most users see.
-    const phase = (t / 12000) % 1; // 0..1 over 12s
-    // Sine-ease the used % between 35 and 95
-    const five = 35 + 60 * (0.5 - 0.5 * Math.cos(phase * 2 * Math.PI));
-    const pace5 = 40 + 30 * (0.5 - 0.5 * Math.cos((phase + 0.15) * 2 * Math.PI));
-    const week = 4 + 6 * (0.5 - 0.5 * Math.cos(phase * 2 * Math.PI));
-    const pacew = 6 + 4 * (0.5 - 0.5 * Math.cos((phase + 0.1) * 2 * Math.PI));
-
-    const delta5 = (five - pace5) / 100;
-    const deltaw = (week - pacew) / 100;
-    const c5 = rgb(lerpColor(STOPS_5H, delta5));
-    const cw = rgb(lerpColor(STOPS_WK, deltaw));
-
-    const oFill = document.getElementById("hero-outer");
-    const iFill = document.getElementById("hero-inner");
-    oFill.setAttribute("stroke", c5);
-    oFill.setAttribute("stroke-dasharray", `${Math.min(five, 100) / 100 * HERO_OUTER_C} ${HERO_OUTER_C}`);
-    iFill.setAttribute("stroke", cw);
-    iFill.setAttribute("stroke-dasharray", `${Math.min(week, 100) / 100 * HERO_INNER_C} ${HERO_INNER_C}`);
-    heroSpoke("hero-outer-spoke", HERO_OUTER_R, pace5, 9);
-    heroSpoke("hero-inner-spoke", HERO_INNER_R, pacew, 8);
-
-    document.getElementById("hero-verdict").textContent = verdictWord(delta5);
-    document.getElementById("hero-verdict").setAttribute("fill", c5);
-    document.getElementById("hero-bignum").textContent = fmtTimeLeft(pace5);
-    document.getElementById("hero-bignum").setAttribute("fill", c5);
-    document.getElementById("hero-footer").textContent = `${Math.round(five)}%  ·  wk ${Math.round(week)}%`;
-
-    requestAnimationFrame(heroTick);
-  }
-  requestAnimationFrame(heroTick);
 })();
 </script>
 </body>
