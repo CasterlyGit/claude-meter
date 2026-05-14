@@ -1,6 +1,8 @@
 # claude-meter
 
-A small always-on-top dashboard that shows your live Claude Code token usage. Two concentric rings (Apple Fitness style), every visual property encodes information, no extra widgets.
+[Live demo →](https://casterlygit.github.io/claude-meter/)
+
+A small always-on-top dashboard that mirrors Claude Code's own `/usage` gauges. Two concentric rings, synthwave palette, every visual property encodes information without extra text.
 
 The 5-hour ring lives on the outside. The weekly ring lives on the inside. They share a small dark card pinned to the top-right of your rightmost monitor.
 
@@ -24,34 +26,39 @@ Every visual property is doing work:
 
 Anthropic doesn't expose your 5-hour / weekly quotas as a queryable number. The Claude Code app itself shows you those gauges, but only when you click into it. claude-meter computes the same numbers from your local session transcripts (`~/.claude/projects/**/*.jsonl`) and keeps them in the corner of your eye while you work.
 
-## How it computes usage
+## Setup
 
-For every assistant response in your transcripts, Claude logs a `usage` record:
+The repo ships with two pieces:
+
+1. **The Python overlay** — `claude-meter` command, installs into a venv.
+2. **A statusline hook script** — `scripts/capture-rate-limits.sh`, which you wire into your Claude Code statusline.
+
+After install (see below), register the statusline by adding this to `~/.claude/settings.json`:
 
 ```json
 {
-  "input_tokens": 1,
-  "cache_creation_input_tokens": 999,
-  "cache_read_input_tokens": 264645,
-  "output_tokens": 514
+  "statusLine": {
+    "type": "command",
+    "command": "/Users/<you>/.claude/scripts/capture-rate-limits.sh",
+    "refreshInterval": 30
+  }
 }
 ```
 
-The "billed" total (what counts toward rate limits) is approximated as:
+Restart any active `claude` TUI sessions. The first refresh writes `~/.claude/state/rate-limits.json` and the overlay starts showing real numbers.
 
-```
-billed = input + output + cache_creation + (cache_read × 0.1)
-```
+## Where the numbers come from
 
-Cache reads are heavily discounted at the rate-limit level — that's the 10% multiplier. We sum these across all transcripts whose mtime falls in the rolling window (5 hours for the outer ring, 7 days for the inner).
+claude-meter does **not** estimate. It reads the same numbers Claude Code's own `/usage` panel shows you, via a statusline hook:
 
-## Calibrating the ceilings
+1. The included script `~/.claude/scripts/capture-rate-limits.sh` is registered as your Claude Code statusline command.
+2. Every time Claude Code renders its statusline (default: every 30s in an interactive TUI), it pipes the full UI-state JSON to that script.
+3. The script writes `rate_limits.five_hour.used_percentage` and `rate_limits.seven_day.used_percentage` to `~/.claude/state/rate-limits.json`.
+4. claude-meter reads that file.
 
-The plan tiers ship with rough estimates of token ceilings, calibrated against the Claude Code app's own "% used" gauges. If your in-app % and the meter's % disagree by more than a few points, edit `src/claude_meter/config.py` and adjust the ceiling for your active plan. Math:
+If no live data is available, the rings stay empty and the center shows "no live data". No fallback estimates, no guessed ceilings.
 
-```
-ceiling = your_current_billed_tokens / (app_percent / 100)
-```
+The statusline only fires in **interactive TUI sessions** — not the VS Code extension, not the desktop Claude.app, only `claude` running in a terminal. Keep at least one terminal-based Claude Code session running and the rings will stay live.
 
 ## Install
 

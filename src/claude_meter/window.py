@@ -118,25 +118,29 @@ class MeterWidget(QWidget):
         sunset gold → hot magenta. The 5h ring leans cooler (cyan side), the
         weekly ring leans warmer (sunset side), but both share the same vibe.
         """
+        # Synthwave/Ocean Drive but easier on the eye in the over-cap range,
+        # since that's where the user spends most of their time. We replace
+        # the hot pink/magenta with deep violet → indigo. Still neon, still
+        # signals 'past the line', but doesn't scream.
         if palette == "5h":
             stops = [
-                (-0.30, QColor(  0, 240, 255)),  # electric cyan
-                (-0.15, QColor( 70, 245, 220)),  # neon seafoam
-                (-0.05, QColor(120, 250, 180)),  # neon lime
-                ( 0.05, QColor(190, 255, 100)),  # acid yellow-green
-                ( 0.12, QColor(255, 220,  80)),  # sunset gold
-                ( 0.25, QColor(255, 100, 200)),  # hot pink
-                ( 1.00, QColor(255,  60, 150)),  # neon magenta
+                (-0.30, QColor(  0, 240, 255)),  # electric cyan (way under)
+                (-0.15, QColor( 70, 240, 220)),  # neon seafoam
+                (-0.05, QColor(120, 245, 180)),  # neon lime
+                ( 0.05, QColor(190, 250, 130)),  # acid lime
+                ( 0.12, QColor(180, 200, 255)),  # neon periwinkle (on-pace+)
+                ( 0.25, QColor(155, 130, 255)),  # electric violet (a bit over)
+                ( 1.00, QColor(110,  90, 230)),  # deep indigo (way over)
             ]
         else:
             stops = [
-                (-0.30, QColor( 90, 200, 255)),  # cyan-blue
-                (-0.15, QColor(140, 200, 255)),  # cooler purple-blue
-                (-0.05, QColor(200, 170, 255)),  # neon lavender
-                ( 0.05, QColor(255, 170, 230)),  # cotton-candy pink
-                ( 0.12, QColor(255, 140, 200)),  # bubblegum
-                ( 0.25, QColor(255,  90, 160)),  # hot rose
-                ( 1.00, QColor(255,  50, 130)),  # neon hot pink
+                (-0.30, QColor( 80, 220, 255)),
+                (-0.15, QColor(120, 200, 255)),
+                (-0.05, QColor(170, 180, 255)),
+                ( 0.05, QColor(200, 170, 255)),
+                ( 0.12, QColor(190, 160, 250)),
+                ( 0.25, QColor(160, 120, 240)),
+                ( 1.00, QColor(120, 100, 220)),
             ]
         for i, (t, c) in enumerate(stops):
             if delta <= t:
@@ -215,19 +219,15 @@ class MeterWidget(QWidget):
         if self._five_hour is None or self._weekly is None:
             return
 
-        limits = config.active_limit()
-
-        # Prefer Claude's own gauge values if the statusline hook captured them
+        # Real data only. No fallback estimates.
         official5 = self._official_pct("five_hour")
         officialw = self._official_pct("seven_day")
-        if official5 is not None:
-            raw5 = official5
-        else:
-            raw5 = self._five_hour.billed_tokens / max(limits.five_hour_ceiling, 1)
-        if officialw is not None:
-            raww = officialw
-        else:
-            raww = self._weekly.billed_tokens / max(limits.weekly_ceiling, 1)
+        if official5 is None or officialw is None:
+            self._draw_waiting_state(painter)
+            return
+
+        raw5 = official5
+        raww = officialw
         frac5 = min(raw5, 1.0)
         fracw = min(raww, 1.0)
 
@@ -272,6 +272,56 @@ class MeterWidget(QWidget):
         self._draw_pace_marker(painter, inner_rect, tw, pacew)
 
         self._draw_center_text(painter, frac5, fracw, delta5, deltaw)
+
+    def _draw_waiting_state(self, painter):
+        """Render when no live rate-limit data is available.
+
+        Draws empty ring outlines and a small 'waiting' message in the center.
+        No estimates, no guessed numbers — the user asked for real data only.
+        """
+        cx = self.SIZE / 2
+        cy = self.SIZE / 2
+
+        outer_inset = 14
+        outer_diam = self.SIZE - 2 * outer_inset
+        inner_inset = outer_inset + self.BASE_RING_THICKNESS + self.RING_GAP
+        inner_diam = self.SIZE - 2 * inner_inset
+
+        # Two faint ring outlines
+        for rect_tuple, thickness in [
+            ((outer_inset, outer_inset, outer_diam, outer_diam), self.BASE_RING_THICKNESS),
+            ((inner_inset, inner_inset, inner_diam, inner_diam), self.BASE_RING_THICKNESS),
+        ]:
+            x, y, w, h = rect_tuple
+            pen = QPen(QColor(255, 255, 255, 25))
+            pen.setWidth(thickness)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawArc(x, y, w, h, 0, 360 * 16)
+
+        # Center message
+        font = QFont("Helvetica Neue")
+        font.setPointSize(9)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255, 130))
+        msg = "—"
+        fm = painter.fontMetrics()
+        mw = fm.horizontalAdvance(msg)
+        painter.drawText(int(cx - mw / 2), int(cy - 4), msg)
+
+        sub_font = QFont("Helvetica Neue")
+        sub_font.setPointSize(7)
+        painter.setFont(sub_font)
+        painter.setPen(QColor(255, 255, 255, 90))
+        sub = "no live data"
+        fm = painter.fontMetrics()
+        sw = fm.horizontalAdvance(sub)
+        painter.drawText(int(cx - sw / 2), int(cy + 10), sub)
+
+        sub2 = "open a claude session"
+        sw2 = fm.horizontalAdvance(sub2)
+        painter.drawText(int(cx - sw2 / 2), int(cy + 22), sub2)
 
     def _draw_pace_marker(self, painter, rect_tuple, thickness, pace):
         """A radial spoke crossing the ring track perpendicular to it.
