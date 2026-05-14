@@ -24,7 +24,7 @@ class PlanLimits:
 PLANS = {
     "pro": PlanLimits("Claude Pro", 1_200_000, 12_000_000),
     "max-5x": PlanLimits("Claude Max 5x", 6_000_000, 60_000_000),
-    "max-20x": PlanLimits("Claude Max 20x", 32_400_000, 320_000_000),
+    "max-20x": PlanLimits("Claude Max 20x", 36_800_000, 368_000_000),
     "console": PlanLimits("Console API", 999_999_999, 999_999_999),
 }
 

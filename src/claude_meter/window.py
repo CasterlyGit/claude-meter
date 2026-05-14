@@ -114,28 +114,29 @@ class MeterWidget(QWidget):
     def _verdict_color(self, delta: float, palette: str = "5h") -> QColor:
         """delta = actual - expected (fraction units).
 
-        Palette: cool→sage→cream→rose. No orange. Two parallel palettes for
-        the rings to stay distinct while sharing the same emotional arc.
+        Ocean Drive / synthwave neon palette: electric cyan → seafoam → lime →
+        sunset gold → hot magenta. The 5h ring leans cooler (cyan side), the
+        weekly ring leans warmer (sunset side), but both share the same vibe.
         """
         if palette == "5h":
             stops = [
-                (-0.30, QColor( 95, 200, 220)),  # cool teal (way under)
-                (-0.15, QColor(140, 220, 200)),  # mint
-                (-0.05, QColor(180, 225, 165)),  # cool green
-                ( 0.05, QColor(210, 225, 150)),  # on-pace
-                ( 0.12, QColor(225, 220, 140)),  # soft cream-yellow
-                ( 0.25, QColor(235, 160, 175)),  # dusty rose
-                ( 1.00, QColor(225, 100, 140)),  # cool pink (way over)
+                (-0.30, QColor(  0, 240, 255)),  # electric cyan
+                (-0.15, QColor( 70, 245, 220)),  # neon seafoam
+                (-0.05, QColor(120, 250, 180)),  # neon lime
+                ( 0.05, QColor(190, 255, 100)),  # acid yellow-green
+                ( 0.12, QColor(255, 220,  80)),  # sunset gold
+                ( 0.25, QColor(255, 100, 200)),  # hot pink
+                ( 1.00, QColor(255,  60, 150)),  # neon magenta
             ]
         else:
             stops = [
-                (-0.30, QColor(130, 195, 200)),
-                (-0.15, QColor(165, 215, 190)),
-                (-0.05, QColor(195, 220, 165)),
-                ( 0.05, QColor(215, 220, 150)),
-                ( 0.12, QColor(220, 215, 150)),
-                ( 0.25, QColor(225, 170, 175)),
-                ( 1.00, QColor(215, 120, 140)),
+                (-0.30, QColor( 90, 200, 255)),  # cyan-blue
+                (-0.15, QColor(140, 200, 255)),  # cooler purple-blue
+                (-0.05, QColor(200, 170, 255)),  # neon lavender
+                ( 0.05, QColor(255, 170, 230)),  # cotton-candy pink
+                ( 0.12, QColor(255, 140, 200)),  # bubblegum
+                ( 0.25, QColor(255,  90, 160)),  # hot rose
+                ( 1.00, QColor(255,  50, 130)),  # neon hot pink
             ]
         for i, (t, c) in enumerate(stops):
             if delta <= t:
