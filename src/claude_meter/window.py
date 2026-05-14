@@ -896,48 +896,29 @@ class MeterWidget(QWidget):
 
         color5 = self._verdict_color(delta5, "5h")
 
-        # Center stack — slightly smaller than before, with the 5h budget %
-        # alongside the time so you read both at a glance.
-        #
-        # Layout (centered on cx, anchored above/below cy):
-        #
-        #             4h 43m         ← big, color-matched (time left in window)
-        #          ── 5h · 38% ──     ← caption: scope and budget %
-        #             ON PACE         ← verdict word
-        #
-        big_font = QFont("Helvetica Neue")
-        big_font.setPointSize(19)
-        big_font.setBold(True)
-        painter.setFont(big_font)
+        # Center stack — three equal-weight lines, all color-matched:
+        #             38% USED
+        #             4h 43m
+        #             ON PACE
+        line_font = QFont("Helvetica Neue")
+        line_font.setPointSize(11)
+        line_font.setBold(True)
+        painter.setFont(line_font)
         painter.setPen(color5)
+        fm = painter.fontMetrics()
+        line_h = fm.height()
+
+        pct_str = f"{int(round(min(frac5, 1.0) * 100))}% USED"
         win_left = self._window_time_left(self._five_hour, config.FIVE_HOUR_WINDOW)
-        fm = painter.fontMetrics()
-        tw = fm.horizontalAdvance(win_left)
-        th = fm.ascent()
-        painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 10), win_left)
+        verdict = self._verdict_word(delta5)
 
-        # Caption underneath: scope + budget % in one tight line
-        cap_font = QFont("Helvetica Neue")
-        cap_font.setPointSize(9)
-        cap_font.setBold(True)
-        painter.setFont(cap_font)
-        painter.setPen(QColor(255, 255, 255, 200))
-        pct_str = f"{int(round(min(frac5, 1.0) * 100))}% used"
-        cap_text = f"5h left  ·  {pct_str}"
-        fm = painter.fontMetrics()
-        lw = fm.horizontalAdvance(cap_text)
-        painter.drawText(int(cx - lw / 2), int(cy + th / 2 + 6), cap_text)
-
-        # Verdict word at the bottom of the center
-        verdict_font = QFont("Helvetica Neue")
-        verdict_font.setPointSize(11)
-        verdict_font.setBold(True)
-        painter.setFont(verdict_font)
-        painter.setPen(color5)
-        word = self._verdict_word(delta5)
-        fm = painter.fontMetrics()
-        vw = fm.horizontalAdvance(word)
-        painter.drawText(int(cx - vw / 2), int(cy + th / 2 + 26), word)
+        # Vertically center the three-line block on cy.
+        block_top = cy - line_h * 1.5 + fm.ascent()
+        for i, text_line in enumerate((pct_str, win_left, verdict)):
+            tw = fm.horizontalAdvance(text_line)
+            painter.drawText(int(cx - tw / 2),
+                             int(block_top + i * line_h),
+                             text_line)
 
 
 def main() -> int:
