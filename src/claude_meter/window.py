@@ -86,23 +86,61 @@ class MeterWidget(QWidget):
             return
         self.update()
 
-    # ---- color families per ring ----
+    # ---- color = pace-vs-actual delta ----
+    # The dominant fill color tells you whether you're burning faster than
+    # your budget. Two parallel palettes (5h and weekly) so the rings stay
+    # visually distinct but read the same emotional meaning.
 
-    def _color_5h(self, frac: float) -> QColor:
-        if frac >= config.DANGER_THRESHOLD:
-            return QColor(255, 70, 130)   # hot pink/magenta
-        if frac >= config.WARN_THRESHOLD:
-            return QColor(255, 140, 90)   # coral
-        if frac >= 0.30:
-            return QColor(110, 200, 255)  # cyan
-        return QColor(140, 230, 220)      # mint-cyan idle
+    def _pace_color(self, delta: float, palette: str = "5h") -> QColor:
+        """delta = actual_frac - pace_frac.
+           > 0 means overpacing (burning faster than the linear budget).
+           < 0 means underpacing (safe / have headroom).
 
-    def _color_weekly(self, frac: float) -> QColor:
-        if frac >= config.DANGER_THRESHOLD:
-            return QColor(255, 90, 60)
-        if frac >= config.WARN_THRESHOLD:
-            return QColor(255, 200, 70)
-        return QColor(120, 230, 150)
+           Palettes are perceptually-tuned for at-a-glance reading. 5h uses
+           cool-blue → warm-green → coral → hot-pink. Weekly uses teal →
+           sage → amber → rust. Distinct hues keep the two rings legible
+           together; both follow the same calm→warm→hot emotional arc.
+        """
+        if palette == "5h":
+            stops = [
+                # (delta_threshold, color)
+                (-0.30, QColor( 88, 200, 220)),  # deep teal — way under
+                (-0.15, QColor(120, 220, 200)),  # mint
+                (-0.05, QColor(150, 230, 170)),  # cool green
+                ( 0.05, QColor(180, 230, 140)),  # on-pace lime
+                ( 0.15, QColor(245, 215, 110)),  # warm yellow — gentle nudge
+                ( 0.30, QColor(245, 150, 100)),  # coral — slow down
+                ( 1.00, QColor(240,  90, 140)),  # hot pink — stop
+            ]
+        else:  # weekly
+            stops = [
+                (-0.30, QColor(120, 200, 200)),  # pale teal
+                (-0.15, QColor(150, 220, 180)),  # sage
+                (-0.05, QColor(180, 225, 160)),  # soft lime
+                ( 0.05, QColor(210, 220, 140)),  # honeydew
+                ( 0.15, QColor(240, 200, 110)),  # amber
+                ( 0.30, QColor(235, 150,  90)),  # rust
+                ( 1.00, QColor(220, 100,  80)),  # deep terracotta
+            ]
+        # Linear interpolate between adjacent stops
+        for i, (t, c) in enumerate(stops):
+            if delta <= t:
+                if i == 0:
+                    return c
+                t_prev, c_prev = stops[i - 1]
+                # Lerp
+                span = max(t - t_prev, 1e-6)
+                k = (delta - t_prev) / span
+                k = max(0.0, min(1.0, k))
+                return QColor(
+                    int(c_prev.red()   * (1 - k) + c.red()   * k),
+                    int(c_prev.green() * (1 - k) + c.green() * k),
+                    int(c_prev.blue()  * (1 - k) + c.blue()  * k),
+                )
+        return stops[-1][1]
+
+    def _pace_delta(self, frac: float, pace: float) -> float:
+        return frac - pace
 
     # ---- pace calculation ----
 
@@ -182,6 +220,11 @@ class MeterWidget(QWidget):
         inner_diam = self.SIZE - 2 * inner_inset
         inner_rect = (inner_inset, inner_inset, inner_diam, inner_diam)
 
+        pace5 = self._pace_position(config.FIVE_HOUR_WINDOW)
+        pacew = self._pace_position(config.WEEKLY_WINDOW)
+        delta5 = self._pace_delta(frac5, pace5)
+        deltaw = self._pace_delta(fracw, pacew)
+
         # Outer ring (5h)
         self._draw_loaded_ring(
             painter,
@@ -189,25 +232,25 @@ class MeterWidget(QWidget):
             t5,
             frac=frac5,
             raw_frac=raw5,
-            color=self._color_5h(frac5),
-            pace=self._pace_position(config.FIVE_HOUR_WINDOW),
+            color=self._pace_color(delta5, "5h"),
+            pace=pace5,
             time_pressure=self._time_pressure(config.FIVE_HOUR_WINDOW),
             burn_tpm=self._burn_tpm,
         )
-        # Inner ring (weekly) — no comet tail (weekly burn isn't meaningful at this granularity)
+        # Inner ring (weekly)
         self._draw_loaded_ring(
             painter,
             inner_rect,
             tw,
             frac=fracw,
             raw_frac=raww,
-            color=self._color_weekly(fracw),
-            pace=self._pace_position(config.WEEKLY_WINDOW),
+            color=self._pace_color(deltaw, "weekly"),
+            pace=pacew,
             time_pressure=self._time_pressure(config.WEEKLY_WINDOW),
             burn_tpm=0.0,
         )
 
-        self._draw_center_text(painter, frac5, fracw)
+        self._draw_center_text(painter, frac5, fracw, delta5, deltaw)
 
     def _draw_loaded_ring(
         self,
@@ -299,7 +342,7 @@ class MeterWidget(QWidget):
                 int(overflow_span_deg * 16),
             )
 
-    def _draw_center_text(self, painter, frac5, fracw):
+    def _draw_center_text(self, painter, frac5, fracw, delta5, deltaw):
         cx = self.SIZE / 2
         cy = self.SIZE / 2
 
@@ -307,18 +350,17 @@ class MeterWidget(QWidget):
         big_font.setPointSize(19)
         big_font.setBold(True)
         painter.setFont(big_font)
-        painter.setPen(self._color_5h(frac5))
+        painter.setPen(self._pace_color(delta5, "5h"))
         text = f"{int(round(frac5 * 100))}"
         fm = painter.fontMetrics()
         tw = fm.horizontalAdvance(text)
         th = fm.ascent()
         painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 2), text)
 
-        # tiny weekly % under
         sub_font = QFont("Helvetica Neue")
         sub_font.setPointSize(8)
         painter.setFont(sub_font)
-        painter.setPen(self._color_weekly(fracw))
+        painter.setPen(self._pace_color(deltaw, "weekly"))
         wk_text = f"wk·{int(round(fracw * 100))}"
         fm = painter.fontMetrics()
         ww = fm.horizontalAdvance(wk_text)
