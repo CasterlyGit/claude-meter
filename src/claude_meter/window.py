@@ -61,7 +61,17 @@ class MeterWidget(QWidget):
         self._pin_timer.timeout.connect(lambda: make_always_visible(self))
         self._pin_timer.start(2000)
 
+        # Animation tick: drives the comet tail rotation and pace pulse
+        self._anim_phase = 0.0
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._tick_animation)
+        self._anim_timer.start(50)  # 20fps — smooth motion, low CPU
+
         self._refresh_data()
+
+    def _tick_animation(self) -> None:
+        self._anim_phase = (self._anim_phase + 0.04) % (2 * math.pi)
+        self.update()
 
     def _position_top_right_external(self) -> None:
         app = QApplication.instance()
@@ -267,9 +277,12 @@ class MeterWidget(QWidget):
 
         # Draw the pace markers ON TOP of the fill arcs — radial spokes
         # that stick out past the ring so they're visible regardless of
-        # where the fill currently ends.
-        self._draw_pace_marker(painter, outer_rect, t5, pace5)
-        self._draw_pace_marker(painter, inner_rect, tw, pacew)
+        # where the fill currently ends. Pulse intensity scales with how
+        # far past the marker the fill is (overpacing strength).
+        pulse5 = max(0.0, min(delta5 * 2.0, 1.0))  # 50% delta = full pulse
+        pulsew = max(0.0, min(deltaw * 2.0, 1.0))
+        self._draw_pace_marker(painter, outer_rect, t5, pace5, pulse5)
+        self._draw_pace_marker(painter, inner_rect, tw, pacew, pulsew)
 
         self._draw_center_text(painter, frac5, fracw, delta5, deltaw)
 
@@ -287,17 +300,27 @@ class MeterWidget(QWidget):
         inner_inset = outer_inset + self.BASE_RING_THICKNESS + self.RING_GAP
         inner_diam = self.SIZE - 2 * inner_inset
 
-        # Two faint ring outlines
-        for rect_tuple, thickness in [
+        # Two faint ring outlines + a slow synthwave-cyan sweep so the
+        # waiting state feels alive, not broken
+        for idx, (rect_tuple, thickness) in enumerate([
             ((outer_inset, outer_inset, outer_diam, outer_diam), self.BASE_RING_THICKNESS),
             ((inner_inset, inner_inset, inner_diam, inner_diam), self.BASE_RING_THICKNESS),
-        ]:
+        ]):
             x, y, w, h = rect_tuple
-            pen = QPen(QColor(255, 255, 255, 25))
+            pen = QPen(QColor(255, 255, 255, 20))
             pen.setWidth(thickness)
             pen.setCapStyle(Qt.RoundCap)
             painter.setPen(pen)
             painter.drawArc(x, y, w, h, 0, 360 * 16)
+
+            # Slow rotating arc — different speeds per ring
+            sweep_pen = QPen(QColor(110, 220, 255, 110))
+            sweep_pen.setWidth(thickness)
+            sweep_pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(sweep_pen)
+            phase = self._anim_phase * (1.0 if idx == 0 else 0.7)
+            start_angle = int(((phase / (2 * math.pi)) * 360 + idx * 180) * 16) % (360 * 16)
+            painter.drawArc(x, y, w, h, start_angle, int(-40 * 16))
 
         # Center message
         font = QFont("Helvetica Neue")
@@ -323,33 +346,39 @@ class MeterWidget(QWidget):
         sw2 = fm.horizontalAdvance(sub2)
         painter.drawText(int(cx - sw2 / 2), int(cy + 22), sub2)
 
-    def _draw_pace_marker(self, painter, rect_tuple, thickness, pace):
+    def _draw_pace_marker(self, painter, rect_tuple, thickness, pace,
+                          pulse_intensity=0.0):
         """A radial spoke crossing the ring track perpendicular to it.
 
         Drawn AFTER the fill arc so it's always on top. Extends slightly
-        beyond the ring on both sides for max visibility.
+        beyond the ring on both sides for max visibility. The pulse_intensity
+        argument (0..1) modulates the glow halo around the marker — higher
+        = faster, brighter pulse, used to signal "you're overpacing right now."
         """
         if pace <= 0:
             return
         x, y, w, h = rect_tuple
-        # Center of the ring
         cx_local = x + w / 2.0
         cy_local = y + h / 2.0
-        # Ring radius (mid-line of the stroke)
         r = w / 2.0
-        # Angle in radians; 12 o'clock = -pi/2 in Qt screen coords
-        # (Y grows downward, so we use -sin for the upward direction)
-        angle_deg = 90 - 360 * pace  # clockwise from 12
+        angle_deg = 90 - 360 * pace
         angle_rad = math.radians(angle_deg)
-        # Inner/outer endpoints of the spoke
-        half = thickness / 2.0 + 3  # extends 3px past the ring on each side
+        half = thickness / 2.0 + 3
         x1 = cx_local + math.cos(angle_rad) * (r - half)
         y1 = cy_local - math.sin(angle_rad) * (r - half)
         x2 = cx_local + math.cos(angle_rad) * (r + half)
         y2 = cy_local - math.sin(angle_rad) * (r + half)
 
-        # Bright white spoke with a thin dark outline for contrast against
-        # both the fill color AND the track.
+        # Soft halo that pulses when overpacing — sin wave of self._anim_phase
+        if pulse_intensity > 0:
+            pulse = (math.sin(self._anim_phase * (1 + pulse_intensity * 2)) + 1) / 2
+            halo_alpha = int(60 + 80 * pulse * pulse_intensity)
+            halo_pen = QPen(QColor(255, 255, 255, halo_alpha))
+            halo_pen.setWidth(int(6 + 4 * pulse_intensity))
+            halo_pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(halo_pen)
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
         pen_outline = QPen(QColor(0, 0, 0, 200))
         pen_outline.setWidth(4)
         pen_outline.setCapStyle(Qt.RoundCap)
