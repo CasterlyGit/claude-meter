@@ -36,9 +36,11 @@ class MeterWidget(QWidget):
     HEIGHT = SIZE
     MARGIN_FROM_EDGE = 14
     # Collapsed-dot mode: shrinks the widget to a tiny circle that still
-    # shows the 5h urgency hue. Right-click toggles. Single-click on the
-    # dot expands back.
+    # shows the 5h urgency hue. Click the chevron on the widget to toggle.
     DOT_SIZE = 22
+    # Chevron button geometry (top-right corner when expanded).
+    CHEV_SIZE = 18
+    CHEV_MARGIN = 6
     BASE_RING_THICKNESS = 9
     MAX_RING_THICKNESS = 14
     MIN_RING_THICKNESS = 6
@@ -113,17 +115,33 @@ class MeterWidget(QWidget):
         self._position_top_right_external()
         self.update()
 
+    def _chev_rect(self):
+        """Rect of the collapse chevron in the expanded widget (top-right corner)."""
+        from PyQt5.QtCore import QRect
+        return QRect(
+            self.WIDTH - self.CHEV_SIZE - self.CHEV_MARGIN,
+            self.CHEV_MARGIN,
+            self.CHEV_SIZE,
+            self.CHEV_SIZE,
+        )
+
     def mousePressEvent(self, event):  # noqa: N802
-        # Left-click on collapsed dot → expand back.
-        # Right-click anywhere → toggle collapse.
+        # When expanded, a click in the top-right chevron toggles collapse.
+        # When collapsed, a click anywhere on the dot expands.
+        # Right-click anywhere also toggles (kept for power users).
         if event.button() == Qt.RightButton:
             self._set_collapsed(not self._collapsed)
             event.accept()
             return
-        if event.button() == Qt.LeftButton and self._collapsed:
-            self._set_collapsed(False)
-            event.accept()
-            return
+        if event.button() == Qt.LeftButton:
+            if self._collapsed:
+                self._set_collapsed(False)
+                event.accept()
+                return
+            if self._chev_rect().contains(event.pos()):
+                self._set_collapsed(True)
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def showEvent(self, event):  # noqa: N802
@@ -328,6 +346,32 @@ class MeterWidget(QWidget):
 
         self._draw_center_text(painter, frac5, fracw, delta5, deltaw)
         self._draw_side_panel(painter, frac5, fracw, delta5, deltaw)
+        self._draw_collapse_chevron(painter)
+
+    def _draw_collapse_chevron(self, painter):
+        """Small clickable chevron in the top-right of the expanded widget.
+        Click it to collapse to the dot."""
+        rect = self._chev_rect()
+        # Subtle background circle for the hit target
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 26))
+        painter.drawEllipse(rect)
+
+        # Draw a ">" pointing right (toward the edge of the screen) — visual
+        # metaphor: "tuck me away to the right."
+        chev_pen = QPen(QColor(230, 230, 240, 220))
+        chev_pen.setWidth(2)
+        chev_pen.setCapStyle(Qt.RoundCap)
+        chev_pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(chev_pen)
+        cx = rect.x() + rect.width() / 2
+        cy = rect.y() + rect.height() / 2
+        s = 4.0  # arm length
+        # ">" shape
+        painter.drawLine(int(cx - s + 1), int(cy - s),
+                         int(cx + s - 1), int(cy))
+        painter.drawLine(int(cx + s - 1), int(cy),
+                         int(cx - s + 1), int(cy + s))
 
     def _paint_collapsed_dot(self, painter):
         """Tiny circle showing the 5h urgency hue. Pulses gently when in danger."""
