@@ -123,18 +123,18 @@ class WindowStats:
         return max((self.latest - self.earliest).total_seconds() / 60.0, 1.0)
 
 
-def burn_rate_last_n_minutes(now: datetime, minutes: float = 5.0) -> float:
-    """Tokens-per-minute over the last N minutes only.
+def burn_rate_last_n_minutes(now: datetime, minutes: float = 30.0) -> float:
+    """Average tokens-per-minute over the last N minutes.
 
-    Distinct from WindowStats.tokens_per_minute, which averages across the
-    entire window since the earliest sample. This one gives a recent
-    snapshot — useful for the comet tail / acceleration cue.
+    Uses BILLED tokens (matches what counts against the rate limit), not
+    raw. Default window is 30 minutes — long enough to smooth out bursts
+    so a single big message doesn't make 'time until cap' read like 1m.
     """
     since = now - timedelta(minutes=minutes)
     samples = list(iter_recent_samples(since))
     if not samples:
         return 0.0
-    total = sum(s.raw_total_tokens for s in samples)
+    total = sum(s.total_billed_tokens for s in samples)
     return total / minutes
 
 

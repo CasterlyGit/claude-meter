@@ -91,47 +91,47 @@ class MeterWidget(QWidget):
     # your budget. Two parallel palettes (5h and weekly) so the rings stay
     # visually distinct but read the same emotional meaning.
 
-    def _pace_color(self, delta: float, palette: str = "5h") -> QColor:
-        """delta = actual_frac - pace_frac.
-           > 0 means overpacing (burning faster than the linear budget).
-           < 0 means underpacing (safe / have headroom).
+    def _verdict_color(self, ratio: float, palette: str = "5h") -> QColor:
+        """ratio comes from _will_hit_cap_ratio.
+              -1 = idle (no burn) → calm color
+               0..0.5 = comfortable (rest easy / fine)
+               0.5..1.0 = on pace / ease
+               1.0..1.5 = slow
+               1.5+ = stop
 
-           Palettes are perceptually-tuned for at-a-glance reading. 5h uses
-           cool-blue → warm-green → coral → hot-pink. Weekly uses teal →
-           sage → amber → rust. Distinct hues keep the two rings legible
-           together; both follow the same calm→warm→hot emotional arc.
+           Palette: NO orange. Soft cool→sage→rose. Weekly palette is the
+           same hue family at slightly lower saturation so the rings stay
+           visually distinct.
         """
+        # Idle → mute calm
+        if ratio < 0:
+            return QColor(140, 200, 215) if palette == "5h" else QColor(160, 200, 200)
+
         if palette == "5h":
             stops = [
-                # (delta_threshold, color)
-                (-0.30, QColor( 88, 200, 220)),  # deep teal — way under
-                (-0.15, QColor(120, 220, 200)),  # mint
-                (-0.05, QColor(150, 230, 170)),  # cool green
-                ( 0.05, QColor(180, 230, 140)),  # on-pace lime
-                ( 0.15, QColor(245, 215, 110)),  # warm yellow — gentle nudge
-                ( 0.30, QColor(245, 150, 100)),  # coral — slow down
-                ( 1.00, QColor(240,  90, 140)),  # hot pink — stop
+                (0.00, QColor( 95, 200, 220)),  # cool blue-teal
+                (0.50, QColor(140, 220, 200)),  # mint
+                (0.80, QColor(180, 225, 165)),  # cool green
+                (1.00, QColor(225, 220, 140)),  # soft yellow (NOT orange)
+                (1.30, QColor(235, 160, 175)),  # dusty rose
+                (1.80, QColor(225, 100, 140)),  # cool pink
             ]
-        else:  # weekly
+        else:
             stops = [
-                (-0.30, QColor(120, 200, 200)),  # pale teal
-                (-0.15, QColor(150, 220, 180)),  # sage
-                (-0.05, QColor(180, 225, 160)),  # soft lime
-                ( 0.05, QColor(210, 220, 140)),  # honeydew
-                ( 0.15, QColor(240, 200, 110)),  # amber
-                ( 0.30, QColor(235, 150,  90)),  # rust
-                ( 1.00, QColor(220, 100,  80)),  # deep terracotta
+                (0.00, QColor(130, 195, 200)),  # pale teal
+                (0.50, QColor(165, 215, 190)),  # sage
+                (0.80, QColor(195, 220, 165)),  # honeydew
+                (1.00, QColor(220, 215, 150)),  # cream-yellow
+                (1.30, QColor(225, 170, 175)),  # mauve
+                (1.80, QColor(215, 120, 140)),  # rose
             ]
-        # Linear interpolate between adjacent stops
         for i, (t, c) in enumerate(stops):
-            if delta <= t:
+            if ratio <= t:
                 if i == 0:
                     return c
                 t_prev, c_prev = stops[i - 1]
-                # Lerp
                 span = max(t - t_prev, 1e-6)
-                k = (delta - t_prev) / span
-                k = max(0.0, min(1.0, k))
+                k = max(0.0, min(1.0, (ratio - t_prev) / span))
                 return QColor(
                     int(c_prev.red()   * (1 - k) + c.red()   * k),
                     int(c_prev.green() * (1 - k) + c.green() * k),
@@ -139,31 +139,48 @@ class MeterWidget(QWidget):
                 )
         return stops[-1][1]
 
-    def _pace_delta(self, frac: float, pace: float) -> float:
-        return frac - pace
-
     # ---- pace calculation ----
 
     def _pace_position(self, window_hours: float) -> float:
-        """Where you 'should be' at this moment, as a fraction 0..1.
+        """How far through the window we are (0..1).
 
-        For a rolling window, the pace position is just (elapsed_in_window /
-        total_window). But for a rolling window you're ALWAYS in the middle
-        of it — there's no clean "elapsed." So we use the time since the
-        earliest sample in the window as a proxy: how long have you been
-        actively using the window.
+        Used only for track-opacity ('time pressure') visualization, not for
+        the verdict — the verdict now uses the simpler 'will I hit the cap
+        before the window resets' heuristic instead.
         """
         if window_hours <= 0:
             return 0.0
-        # For a rolling window, the "pace" reference is uniform: by linearity,
-        # you should be at fraction = (window_age / window_total).
-        # We approximate window_age as time since the earliest sample.
         stats = self._five_hour if window_hours <= 6 else self._weekly
-        if stats is None or stats.earliest is None or stats.latest is None:
+        if stats is None or stats.earliest is None:
             return 0.0
         elapsed_min = (counter.now_utc() - stats.earliest).total_seconds() / 60.0
         total_min = window_hours * 60.0
         return max(0.0, min(elapsed_min / total_min, 1.0))
+
+    def _will_hit_cap_ratio(self, stats, ceiling: int, burn_tpm: float,
+                            window_hours: float) -> float:
+        """Returns a number where:
+              0  = idle / will never hit cap (REST EASY)
+              0.5 = will hit cap exactly when window resets (ON PACE)
+              1+  = will hit cap WELL before window resets (STOP)
+
+        = (window_time_left / time_until_cap) clipped sensibly.
+        """
+        if stats is None or burn_tpm <= 0:
+            return -1.0  # idle sentinel
+        # time until cap at current burn (minutes)
+        remaining_tokens = max(ceiling - stats.billed_tokens, 0)
+        if remaining_tokens <= 0:
+            return 2.0  # already over
+        time_until_cap = remaining_tokens / burn_tpm  # minutes
+        # time left in the rolling window
+        if stats.earliest is None:
+            return 0.0
+        elapsed_min = (counter.now_utc() - stats.earliest).total_seconds() / 60.0
+        window_left = max(window_hours * 60.0 - elapsed_min, 0.0)
+        if time_until_cap <= 0:
+            return 2.0
+        return window_left / time_until_cap
 
     # ---- time pressure (drives track opacity) ----
 
@@ -222,35 +239,36 @@ class MeterWidget(QWidget):
 
         pace5 = self._pace_position(config.FIVE_HOUR_WINDOW)
         pacew = self._pace_position(config.WEEKLY_WINDOW)
-        delta5 = self._pace_delta(frac5, pace5)
-        deltaw = self._pace_delta(fracw, pacew)
+        ratio5 = self._will_hit_cap_ratio(
+            self._five_hour, limits.five_hour_ceiling,
+            self._burn_tpm, config.FIVE_HOUR_WINDOW,
+        )
+        # For the weekly ring, use a slower burn-rate (avg over last hour)
+        # because weekly trends are about hours, not minutes.
+        burn_weekly = self._burn_tpm  # for now, same source
+        ratiow = self._will_hit_cap_ratio(
+            self._weekly, limits.weekly_ceiling,
+            burn_weekly, config.WEEKLY_WINDOW,
+        )
 
-        # Outer ring (5h)
         self._draw_loaded_ring(
-            painter,
-            outer_rect,
-            t5,
-            frac=frac5,
-            raw_frac=raw5,
-            color=self._pace_color(delta5, "5h"),
+            painter, outer_rect, t5,
+            frac=frac5, raw_frac=raw5,
+            color=self._verdict_color(ratio5, "5h"),
             pace=pace5,
             time_pressure=self._time_pressure(config.FIVE_HOUR_WINDOW),
             burn_tpm=self._burn_tpm,
         )
-        # Inner ring (weekly)
         self._draw_loaded_ring(
-            painter,
-            inner_rect,
-            tw,
-            frac=fracw,
-            raw_frac=raww,
-            color=self._pace_color(deltaw, "weekly"),
+            painter, inner_rect, tw,
+            frac=fracw, raw_frac=raww,
+            color=self._verdict_color(ratiow, "weekly"),
             pace=pacew,
             time_pressure=self._time_pressure(config.WEEKLY_WINDOW),
             burn_tpm=0.0,
         )
 
-        self._draw_center_text(painter, frac5, fracw, delta5, deltaw)
+        self._draw_center_text(painter, frac5, fracw, ratio5, ratiow)
 
     def _draw_loaded_ring(
         self,
@@ -380,69 +398,77 @@ class MeterWidget(QWidget):
             return f"{h}h"
         return f"{h}h {m}m"
 
-    def _verdict_word(self, delta: float) -> str:
-        """One-word answer to 'should I slow down?'.
+    def _verdict_word(self, ratio: float) -> str:
+        """ratio from _will_hit_cap_ratio.
 
-        Matches the color stops so the word and the hue agree.
+        -1  = idle
+         0..0.5 = comfortable (REST EASY)
+         0.5..0.8 = comfortable (FINE)
+         0.8..1.0 = on the edge (ON PACE)
+         1.0..1.3 = a little fast (EASE)
+         1.3..1.8 = noticeably fast (SLOW)
+         1.8+ = stop
         """
-        if delta >= 0.30:
-            return "STOP"
-        if delta >= 0.15:
-            return "SLOW"
-        if delta >= 0.05:
-            return "EASE"
-        if delta >= -0.05:
-            return "ON PACE"
-        if delta >= -0.15:
+        if ratio < 0:
+            return "IDLE"
+        if ratio < 0.5:
+            return "REST EASY"
+        if ratio < 0.8:
             return "FINE"
-        return "REST EASY"
+        if ratio < 1.0:
+            return "ON PACE"
+        if ratio < 1.3:
+            return "EASE"
+        if ratio < 1.8:
+            return "SLOW"
+        return "STOP"
 
-    def _draw_center_text(self, painter, frac5, fracw, delta5, deltaw):
+    def _draw_center_text(self, painter, frac5, fracw, ratio5, ratiow):
         cx = self.SIZE / 2
         cy = self.SIZE / 2
 
         limits = config.active_limit()
+        color5 = self._verdict_color(ratio5, "5h")
 
-        # 1. Verdict word at the top — at-a-glance answer
+        # 1. Verdict word at the top
         verdict_font = QFont("Helvetica Neue")
         verdict_font.setPointSize(8)
         verdict_font.setBold(True)
         painter.setFont(verdict_font)
-        painter.setPen(self._pace_color(delta5, "5h"))
-        word = self._verdict_word(delta5)
+        painter.setPen(color5)
+        word = self._verdict_word(ratio5)
         fm = painter.fontMetrics()
         vw = fm.horizontalAdvance(word)
         painter.drawText(int(cx - vw / 2), int(cy - 24), word)
 
-        # 2. Big number = time until you hit the 5h cap at current burn rate
+        # 2. Big number = time left in the 5h window (always meaningful)
         big_font = QFont("Helvetica Neue")
         big_font.setPointSize(15)
         big_font.setBold(True)
         painter.setFont(big_font)
-        painter.setPen(self._pace_color(delta5, "5h"))
-        cap_text = self._time_until_cap(self._five_hour, limits.five_hour_ceiling, self._burn_tpm)
+        painter.setPen(color5)
+        win_left = self._window_time_left(self._five_hour, config.FIVE_HOUR_WINDOW)
         fm = painter.fontMetrics()
-        tw = fm.horizontalAdvance(cap_text)
+        tw = fm.horizontalAdvance(win_left)
         th = fm.ascent()
-        painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 4), cap_text)
+        painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 4), win_left)
 
-        # "until cap" small label under the big number
+        # Small label under the big number
         label_font = QFont("Helvetica Neue")
         label_font.setPointSize(7)
         painter.setFont(label_font)
         painter.setPen(QColor(255, 255, 255, 110))
-        lbl = "until cap"
+        lbl = "5h window left"
         fm = painter.fontMetrics()
         lw = fm.horizontalAdvance(lbl)
         painter.drawText(int(cx - lw / 2), int(cy + th / 2 + 6), lbl)
 
-        # 3. Bottom line: window time left + weekly %
+        # 3. Bottom line: 5h % · weekly %
         sub_font = QFont("Helvetica Neue")
         sub_font.setPointSize(7)
         painter.setFont(sub_font)
         painter.setPen(QColor(255, 255, 255, 150))
-        win_left = self._window_time_left(self._five_hour, config.FIVE_HOUR_WINDOW)
-        bottom = f"{win_left} left · wk {int(round(fracw * 100))}"
+        bottom = f"{int(round(frac5 * 100))}%  ·  wk {int(round(fracw * 100))}%"
         fm = painter.fontMetrics()
         bw = fm.horizontalAdvance(bottom)
         painter.drawText(int(cx - bw / 2), int(cy + th / 2 + 18), bottom)
