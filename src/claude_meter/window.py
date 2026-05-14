@@ -169,6 +169,23 @@ class MeterWidget(QWidget):
             return None
         return float(block.get("used_percentage", 0.0)) / 100.0
 
+    def _data_age_seconds(self) -> float | None:
+        """How old is the captured rate-limits data, in seconds.
+
+        Reads the `captured_at` ISO timestamp from the official block and
+        diffs against now(UTC). Returns None if no data yet."""
+        if not self._official:
+            return None
+        cap = self._official.get("captured_at")
+        if not cap:
+            return None
+        from datetime import datetime, timezone
+        try:
+            ts = datetime.fromisoformat(str(cap).replace("Z", "+00:00"))
+        except Exception:
+            return None
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+
     def _official_resets_at(self, key: str) -> str | None:
         if not self._official:
             return None
@@ -896,15 +913,14 @@ class MeterWidget(QWidget):
 
         color5 = self._verdict_color(delta5, "5h")
 
-        # Center stack — three equal-weight lines, all color-matched:
-        #             38% USED
-        #             4h 43m
-        #             ON PACE
+        # Center stack — three equal-size lines, distinguished by weight and
+        # alpha rather than by font size:
+        #   line 1 (top)    : NN% USED  — color + light  (the *what*)
+        #   line 2 (middle) : 4h 43m    — color + bold   (the *time*, primary)
+        #   line 3 (bottom) : ON PACE   — color + heavy  (the *verdict*, action)
         line_font = QFont("Helvetica Neue")
         line_font.setPointSize(11)
-        line_font.setBold(True)
         painter.setFont(line_font)
-        painter.setPen(color5)
         fm = painter.fontMetrics()
         line_h = fm.height()
 
@@ -912,13 +928,58 @@ class MeterWidget(QWidget):
         win_left = self._window_time_left(self._five_hour, config.FIVE_HOUR_WINDOW)
         verdict = self._verdict_word(delta5)
 
-        # Vertically center the three-line block on cy.
+        # Slightly different alphas/weights per line.
+        dim_color = QColor(color5)
+        dim_color.setAlpha(190)
+        bright_color = QColor(min(color5.red() + 25, 255),
+                              min(color5.green() + 25, 255),
+                              min(color5.blue() + 25, 255), 255)
+
+        lines = (
+            (pct_str,  QFont.Medium,    dim_color),
+            (win_left, QFont.Bold,      color5),
+            (verdict,  QFont.Black,     bright_color),
+        )
+
         block_top = cy - line_h * 1.5 + fm.ascent()
-        for i, text_line in enumerate((pct_str, win_left, verdict)):
-            tw = fm.horizontalAdvance(text_line)
+        for i, (text_line, weight, color) in enumerate(lines):
+            f = QFont(line_font)
+            f.setWeight(weight)
+            painter.setFont(f)
+            painter.setPen(color)
+            fm_line = painter.fontMetrics()
+            tw = fm_line.horizontalAdvance(text_line)
             painter.drawText(int(cx - tw / 2),
                              int(block_top + i * line_h),
                              text_line)
+
+        # Stale-data warning: if the captured_at is older than 90s, draw a
+        # tiny "stale Xm" pill below the center stack so the user knows the
+        # numbers aren't live. The hook only fires from terminal Claude
+        # sessions, so VSCode-only work drifts.
+        stale_secs = self._data_age_seconds()
+        if stale_secs is not None and stale_secs > 90:
+            mins = int(stale_secs // 60)
+            stale_text = f"stale {mins}m" if mins >= 1 else f"stale {int(stale_secs)}s"
+            stale_font = QFont("Helvetica Neue")
+            stale_font.setPointSize(8)
+            stale_font.setBold(True)
+            painter.setFont(stale_font)
+            fm_s = painter.fontMetrics()
+            sw = fm_s.horizontalAdvance(stale_text)
+            sh = fm_s.height()
+            pad_x, pad_y = 6, 2
+            pill_w = sw + pad_x * 2
+            pill_h = sh + pad_y
+            px = int(cx - pill_w / 2)
+            py = int(block_top + 3 * line_h + 4)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(200, 100, 60, 220))
+            painter.drawRoundedRect(px, py, pill_w, pill_h, 6, 6)
+            painter.setPen(QColor(15, 17, 22, 255))
+            painter.drawText(int(cx - sw / 2),
+                             int(py + pad_y + fm_s.ascent() - 1),
+                             stale_text)
 
 
 def main() -> int:
