@@ -576,68 +576,114 @@ class MeterWidget(QWidget):
         label_font.setPointSize(10)
         label_font.setBold(True)
 
+        # Two dual-track rows: ●━━━━━━━━━━━━━━━  with a thin time-tick on
+        # the same track. The gap between budget-fill and time-tick IS the
+        # pace story — no separate "elapsed" row needed.
         rows = [
-            ("5h used",     frac5,  c5),
-            ("5h elapsed",  pace5,  QColor(180, 180, 200, 220)),
-            ("week used",   fracw,  cw),
-            ("week elap.",  pacew,  QColor(180, 180, 200, 220)),
+            ("clock",    frac5, pace5, c5),    # 5-hour pair
+            ("calendar", fracw, pacew, cw),    # weekly pair
         ]
+        # Re-space for two big rows instead of four small ones.
+        row_top = 38
+        row_h = 60
 
-        # Pulse drives the knob glow & breathing
-        pulse = (math.sin(self._anim_phase) + 1) / 2  # 0..1
+        pulse = (math.sin(self._anim_phase) + 1) / 2
 
-        # Value-readout font (the "38%" sitting at the right end of each row)
         value_font = QFont("Helvetica Neue")
-        value_font.setPointSize(10)
+        value_font.setPointSize(12)
         value_font.setBold(True)
 
-        for i, (label, value, color) in enumerate(rows):
+        for i, (icon, fill_v, time_v, color) in enumerate(rows):
             y_lbl = row_top + i * row_h
-            y_track = y_lbl + 16
+            y_track = y_lbl + 22
 
-            painter.setFont(label_font)
-            painter.setPen(QColor(255, 255, 255, 210))  # was 130 — now legible
-            painter.drawText(x_lbl, y_lbl, label.upper())
+            # Icon (no words) — sits left of the track
+            self._draw_pair_icon(painter, icon, x_lbl, y_lbl - 4, color)
 
-            # Track
+            # Track (rail)
             track_pen = QPen(QColor(255, 255, 255, 55))
-            track_pen.setWidth(3)
+            track_pen.setWidth(4)
             track_pen.setCapStyle(Qt.RoundCap)
             painter.setPen(track_pen)
-            painter.drawLine(x_track, y_track, x_track + track_w, y_track)
+            painter.drawLine(x_track + 24, y_track,
+                             x_track + 24 + track_w - 24, y_track)
 
-            knob_x = int(x_track + min(value, 1.0) * track_w)
+            track_left  = x_track + 24
+            track_right = track_left + (track_w - 24)
+            track_span  = track_right - track_left
 
-            # Colored fill segment
+            fill_x = int(track_left + min(fill_v, 1.0) * track_span)
+            time_x = int(track_left + min(time_v, 1.0) * track_span)
+
+            # Colored fill (budget consumed)
             fill_pen = QPen(color)
-            fill_pen.setWidth(3)
+            fill_pen.setWidth(6)
             fill_pen.setCapStyle(Qt.RoundCap)
             painter.setPen(fill_pen)
-            painter.drawLine(x_track, y_track, knob_x, y_track)
+            painter.drawLine(track_left, y_track, fill_x, y_track)
 
-            # KNOB with breathing halo — always-on motion
-            halo_r = int(9 + pulse * 3)
+            # Bright knob at the fill head, with breathing halo
+            halo_r = int(11 + pulse * 3)
             halo_color = QColor(color)
             halo_color.setAlpha(int(60 + pulse * 90))
             painter.setPen(Qt.NoPen)
             painter.setBrush(halo_color)
-            painter.drawEllipse(knob_x - halo_r, y_track - halo_r, halo_r * 2, halo_r * 2)
-            # Solid bright center
+            painter.drawEllipse(fill_x - halo_r, y_track - halo_r, halo_r * 2, halo_r * 2)
             bright = QColor(color)
             bright.setRgb(min(color.red() + 30, 255),
                           min(color.green() + 30, 255),
                           min(color.blue() + 30, 255))
             painter.setBrush(bright)
-            painter.drawEllipse(knob_x - 5, y_track - 5, 10, 10)
+            painter.drawEllipse(fill_x - 6, y_track - 6, 12, 12)
 
-            # Value readout — small % at the right edge of the row, aligned
-            # with the label baseline so the row reads as one unit.
+            # Time tick — small white vertical mark on the same rail.
+            # Outline (black) then white center for legibility on both
+            # filled and unfilled portions.
+            tick_h = 14
+            tick_pen_bg = QPen(QColor(0, 0, 0, 200))
+            tick_pen_bg.setWidth(5)
+            tick_pen_bg.setCapStyle(Qt.RoundCap)
+            painter.setPen(tick_pen_bg)
+            painter.drawLine(time_x, y_track - tick_h // 2,
+                             time_x, y_track + tick_h // 2)
+            tick_pen = QPen(QColor(255, 255, 255, 235))
+            tick_pen.setWidth(2)
+            tick_pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(tick_pen)
+            painter.drawLine(time_x, y_track - tick_h // 2,
+                             time_x, y_track + tick_h // 2)
+
+            # Value: just the % of budget, color-matched, right of the track
             painter.setFont(value_font)
             painter.setPen(bright)
-            pct_str = f"{int(round(min(value, 1.0) * 100))}%"
+            pct_str = f"{int(round(min(fill_v, 1.0) * 100))}%"
             fm = painter.fontMetrics()
             pw = fm.horizontalAdvance(pct_str)
-            painter.drawText(x_lbl + track_w - pw + 4, y_lbl, pct_str)
+            painter.drawText(int(track_right - pw), int(y_lbl - 2), pct_str)
+
+    def _draw_pair_icon(self, painter, kind: str, x: int, y: int, color: QColor) -> None:
+        """Tiny glyph in place of a row label. kind ∈ {"clock", "calendar"}."""
+        from PyQt5.QtCore import QRect
+        size = 16
+        rect = QRect(x, y, size, size)
+        pen = QPen(color)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        if kind == "clock":
+            # Circle + two hands (12 + 3)
+            painter.drawEllipse(rect)
+            cx = x + size / 2
+            cy = y + size / 2
+            painter.drawLine(int(cx), int(cy), int(cx), int(y + 4))   # minute hand up
+            painter.drawLine(int(cx), int(cy), int(x + size - 4), int(cy))  # hour hand right
+        else:
+            # Calendar: small rectangle with a header bar and a grid notch
+            painter.drawRoundedRect(rect, 2, 2)
+            painter.drawLine(x, y + 5, x + size, y + 5)  # header divider
+            # Two tabs at the top to look like rings
+            painter.drawLine(x + 4, y, x + 4, y + 3)
+            painter.drawLine(x + size - 4, y, x + size - 4, y + 3)
 
     def _draw_pace_marker(self, painter, rect_tuple, thickness, pace,
                           pulse_intensity=0.0):
