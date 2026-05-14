@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>claude-meter</title>
+<style>
+  :root {
+    --bg: #0a0b14;
+    --bg-card: rgba(20, 22, 38, 0.85);
+    --fg: #e6e8f0;
+    --fg-dim: rgba(230, 232, 240, 0.55);
+    --fg-faint: rgba(230, 232, 240, 0.25);
+    --accent: #6e5ae6;
+    --grid: rgba(110, 90, 230, 0.08);
+  }
+  html, body {
+    margin: 0;
+    background:
+      radial-gradient(ellipse at top, rgba(110, 90, 230, 0.18), transparent 60%),
+      radial-gradient(ellipse at bottom right, rgba(0, 240, 255, 0.08), transparent 60%),
+      var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Helvetica Neue", sans-serif;
+    min-height: 100vh;
+  }
+  body {
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+  main {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 56px 24px 96px;
+  }
+  h1 {
+    font-family: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+    font-size: 28px;
+    font-weight: 700;
+    margin: 0 0 4px;
+    letter-spacing: -0.02em;
+  }
+  .tag {
+    color: var(--fg-dim);
+    font-family: "SF Mono", ui-monospace, monospace;
+    font-size: 12px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  .lede {
+    font-size: 17px;
+    line-height: 1.55;
+    max-width: 620px;
+    margin: 18px 0 36px;
+    color: var(--fg);
+  }
+  .stage {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 40px;
+    align-items: center;
+    background: var(--bg-card);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 16px;
+    padding: 32px;
+    margin-bottom: 40px;
+  }
+  @media (max-width: 720px) {
+    .stage { grid-template-columns: 1fr; gap: 20px; }
+    .meter-wrap { margin: 0 auto; }
+  }
+  .meter-wrap {
+    width: 200px;
+    height: 200px;
+    position: relative;
+  }
+  svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+  }
+  .controls {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .control {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .control-row {
+    display: flex;
+    justify-content: space-between;
+    font-family: "SF Mono", ui-monospace, monospace;
+    font-size: 12px;
+    color: var(--fg-dim);
+  }
+  .control-row b {
+    color: var(--fg);
+    font-weight: 600;
+  }
+  input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    background: transparent;
+  }
+  input[type="range"]::-webkit-slider-runnable-track {
+    height: 4px;
+    background: rgba(255, 255, 255, 0.12);
+    border-radius: 2px;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 2px solid var(--bg);
+    margin-top: -6px;
+    box-shadow: 0 0 12px rgba(110, 90, 230, 0.6);
+    cursor: pointer;
+  }
+  .verdict-line {
+    margin-top: 8px;
+    font-family: "SF Mono", ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--fg-dim);
+  }
+  .verdict-word {
+    font-weight: 700;
+    letter-spacing: 0.08em;
+  }
+  section.explain {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    margin-bottom: 40px;
+  }
+  @media (max-width: 720px) {
+    section.explain { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .card h3 {
+    margin: 0 0 8px;
+    font-size: 14px;
+    font-family: "SF Mono", ui-monospace, monospace;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--fg);
+  }
+  .card p {
+    margin: 0;
+    color: var(--fg-dim);
+    font-size: 14px;
+    line-height: 1.55;
+  }
+  .install {
+    background: var(--bg-card);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 24px;
+  }
+  .install h2 {
+    margin: 0 0 12px;
+    font-size: 15px;
+    font-family: "SF Mono", ui-monospace, monospace;
+    color: var(--fg);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  pre {
+    margin: 0;
+    background: rgba(0, 0, 0, 0.4);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-family: "SF Mono", ui-monospace, monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    color: #cfd2dc;
+    border: 1px solid rgba(255, 255, 255, 0.04);
+  }
+  pre .c { color: var(--fg-faint); }
+  pre .k { color: #b6a4ff; }
+  footer {
+    margin-top: 48px;
+    color: var(--fg-faint);
+    font-size: 12px;
+    font-family: "SF Mono", ui-monospace, monospace;
+    letter-spacing: 0.05em;
+  }
+  footer a { color: var(--fg-dim); text-decoration: none; border-bottom: 1px dotted var(--fg-faint); }
+  footer a:hover { color: var(--fg); }
+</style>
+</head>
+<body>
+<main>
+  <span class="tag">claude · meter</span>
+  <h1>Two rings on the corner of your screen.</h1>
+  <p class="lede">
+    A pinned overlay that mirrors Claude Code's own <code>/usage</code> gauges
+    — the 5-hour and 7-day rolling windows. The fill shows what you've spent.
+    The bright spoke on the track shows where a fair pace would put you right
+    now. The color answers <em>am I burning faster than my budget?</em>
+  </p>
+
+  <section class="stage">
+    <div class="meter-wrap">
+      <svg viewBox="0 0 200 200" id="meter">
+        <defs>
+          <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur stdDeviation="3" result="blur"/>
+            <feMerge>
+              <feMergeNode in="blur"/>
+              <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+          </filter>
+        </defs>
+        <!-- background card -->
+        <rect x="6" y="6" width="188" height="188" rx="18" fill="rgba(15,17,22,0.85)" stroke="rgba(255,255,255,0.06)" />
+        <!-- outer ring (5h): track -->
+        <circle cx="100" cy="100" r="80" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="11" id="outer-track"/>
+        <!-- outer ring fill -->
+        <circle cx="100" cy="100" r="80" fill="none" stroke="#5be3c8" stroke-width="11"
+                stroke-linecap="round" stroke-dasharray="0 999" transform="rotate(-90 100 100)" id="outer-fill" filter="url(#glow)"/>
+        <!-- outer pace spoke (drawn last to stay on top) -->
+        <line x1="100" y1="14" x2="100" y2="2" stroke="white" stroke-width="2.5" id="outer-spoke"/>
+        <!-- inner ring (week): track -->
+        <circle cx="100" cy="100" r="58" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="9" id="inner-track"/>
+        <circle cx="100" cy="100" r="58" fill="none" stroke="#8fb6ff" stroke-width="9"
+                stroke-linecap="round" stroke-dasharray="0 999" transform="rotate(-90 100 100)" id="inner-fill" filter="url(#glow)"/>
+        <line x1="100" y1="36" x2="100" y2="24" stroke="white" stroke-width="2.5" id="inner-spoke"/>
+        <!-- text -->
+        <text x="100" y="86" text-anchor="middle" font-family="SF Mono, ui-monospace, monospace" font-size="9" font-weight="700" fill="#5be3c8" letter-spacing="1" id="verdict">ON PACE</text>
+        <text x="100" y="110" text-anchor="middle" font-family="Helvetica Neue, sans-serif" font-size="22" font-weight="700" fill="#5be3c8" id="big-num">2h 18m</text>
+        <text x="100" y="121" text-anchor="middle" font-family="Helvetica Neue, sans-serif" font-size="7" fill="rgba(255,255,255,0.5)">5h window left</text>
+        <text x="100" y="138" text-anchor="middle" font-family="Helvetica Neue, sans-serif" font-size="7" fill="rgba(255,255,255,0.5)" id="footer-line">54% · wk 8%</text>
+      </svg>
+    </div>
+
+    <div class="controls">
+      <div class="control">
+        <div class="control-row"><span>5-hour used</span><b id="lbl-5h">54%</b></div>
+        <input type="range" id="five" min="0" max="200" value="54" />
+      </div>
+      <div class="control">
+        <div class="control-row"><span>Time elapsed in 5h window</span><b id="lbl-pace5">55%</b></div>
+        <input type="range" id="pace5" min="0" max="100" value="55" />
+      </div>
+      <div class="control">
+        <div class="control-row"><span>Weekly used</span><b id="lbl-wk">8%</b></div>
+        <input type="range" id="week" min="0" max="200" value="8" />
+      </div>
+      <div class="control">
+        <div class="control-row"><span>Time elapsed in week</span><b id="lbl-pacew">12%</b></div>
+        <input type="range" id="pacew" min="0" max="100" value="12" />
+      </div>
+      <div class="verdict-line">
+        outer color comes from <span style="color: var(--fg)">5h used − time elapsed</span>.
+        positive number = burning fast; spoke is the line you're crossing.
+      </div>
+    </div>
+  </section>
+
+  <section class="explain">
+    <div class="card">
+      <h3>Reading the ring</h3>
+      <p>The bright fill shows your % used. The thin white spoke marks where a fair pace would put you right now — calculated from time elapsed in the rolling window. If your fill has passed the spoke, you're consuming faster than evenly. If it's behind, you have headroom.</p>
+    </div>
+    <div class="card">
+      <h3>What the color says</h3>
+      <p>Color is purely the gap between fill and spoke. Cyan when you're well behind the spoke, lime when on pace, soft periwinkle as you start to creep ahead, deep violet when you're well past it. No alarms — just at-a-glance answers.</p>
+    </div>
+    <div class="card">
+      <h3>Source of truth</h3>
+      <p>claude-meter reads the same numbers Claude Code's own <code>/usage</code> panel displays, via a statusline hook that captures <code>rate_limits.five_hour</code> and <code>rate_limits.seven_day</code>. When no live data is available, the rings stay empty — no estimates, no guesses.</p>
+    </div>
+    <div class="card">
+      <h3>Where it lives</h3>
+      <p>A 140×140 overlay pinned to the top-right of your rightmost screen via PyObjC. Stays above app windows on every macOS Space. Restartable via launchd so it survives logout.</p>
+    </div>
+  </section>
+
+  <div class="install">
+    <h2>Install</h2>
+    <pre><span class="c"># clone, install, run — that's it</span>
+<span class="k">git</span> clone https://github.com/CasterlyGit/claude-meter
+<span class="k">cd</span> claude-meter
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -e .
+claude-meter <span class="c"># overlay appears top-right of your rightmost display</span></pre>
+  </div>
+
+  <footer>
+    <a href="https://github.com/CasterlyGit/claude-meter">repo</a> ·
+    <a href="https://github.com/CasterlyGit">@casterlygit</a>
+  </footer>
+</main>
+
+<script>
+(function() {
+  // Same color stop logic as the Python implementation, ported to JS so the
+  // demo behaves identically to the live overlay.
+  const STOPS_5H = [
+    [-0.30, [  0, 240, 255]],
+    [-0.15, [ 70, 240, 220]],
+    [-0.05, [120, 245, 180]],
+    [ 0.05, [190, 250, 130]],
+    [ 0.12, [180, 200, 255]],
+    [ 0.25, [155, 130, 255]],
+    [ 1.00, [110,  90, 230]],
+  ];
+  const STOPS_WK = [
+    [-0.30, [ 80, 220, 255]],
+    [-0.15, [120, 200, 255]],
+    [-0.05, [170, 180, 255]],
+    [ 0.05, [200, 170, 255]],
+    [ 0.12, [190, 160, 250]],
+    [ 0.25, [160, 120, 240]],
+    [ 1.00, [120, 100, 220]],
+  ];
+
+  function lerpColor(stops, delta) {
+    for (let i = 0; i < stops.length; i++) {
+      if (delta <= stops[i][0]) {
+        if (i === 0) return stops[0][1];
+        const [tp, cp] = stops[i - 1];
+        const [tn, cn] = stops[i];
+        const k = Math.max(0, Math.min(1, (delta - tp) / (tn - tp)));
+        return [
+          Math.round(cp[0] * (1 - k) + cn[0] * k),
+          Math.round(cp[1] * (1 - k) + cn[1] * k),
+          Math.round(cp[2] * (1 - k) + cn[2] * k),
+        ];
+      }
+    }
+    return stops[stops.length - 1][1];
+  }
+  const rgb = (c) => `rgb(${c[0]},${c[1]},${c[2]})`;
+
+  function verdictWord(delta) {
+    if (delta >= 0.25) return "STOP";
+    if (delta >= 0.12) return "SLOW";
+    if (delta >= 0.05) return "EASE";
+    if (delta >= -0.05) return "ON PACE";
+    if (delta >= -0.15) return "FINE";
+    return "REST EASY";
+  }
+
+  function fmtTimeLeft(elapsedPct) {
+    const totalMin = 300; // 5h
+    const leftMin = Math.max(0, Math.round(totalMin * (1 - elapsedPct / 100)));
+    const h = Math.floor(leftMin / 60);
+    const m = leftMin % 60;
+    if (h === 0) return `${m}m`;
+    if (m === 0) return `${h}h`;
+    return `${h}h ${m}m`;
+  }
+
+  // SVG arc length: circumference = 2πr
+  const OUTER_R = 80;
+  const INNER_R = 58;
+  const OUTER_C = 2 * Math.PI * OUTER_R;
+  const INNER_C = 2 * Math.PI * INNER_R;
+
+  function spokeCoords(cx, cy, r, pacePct, half) {
+    // 12 o'clock = 0°, clockwise positive
+    const ang = (pacePct / 100) * 2 * Math.PI - Math.PI / 2;
+    return {
+      x1: cx + Math.cos(ang) * (r - half),
+      y1: cy + Math.sin(ang) * (r - half),
+      x2: cx + Math.cos(ang) * (r + half),
+      y2: cy + Math.sin(ang) * (r + half),
+    };
+  }
+
+  const el = (id) => document.getElementById(id);
+
+  function update() {
+    const five = parseInt(el("five").value, 10);   // 0..200 (over-cap allowed)
+    const pace5 = parseInt(el("pace5").value, 10); // 0..100
+    const week = parseInt(el("week").value, 10);
+    const pacew = parseInt(el("pacew").value, 10);
+
+    el("lbl-5h").textContent = `${five}%`;
+    el("lbl-pace5").textContent = `${pace5}%`;
+    el("lbl-wk").textContent = `${week}%`;
+    el("lbl-pacew").textContent = `${pacew}%`;
+
+    const delta5 = (five / 100) - (pace5 / 100);
+    const deltaw = (week / 100) - (pacew / 100);
+    const c5 = rgb(lerpColor(STOPS_5H, delta5));
+    const cw = rgb(lerpColor(STOPS_WK, deltaw));
+
+    // Outer fill — clamp visible to 100% of one rotation
+    const fillFrac5 = Math.min(five / 100, 1);
+    el("outer-fill").setAttribute("stroke", c5);
+    el("outer-fill").setAttribute("stroke-dasharray", `${fillFrac5 * OUTER_C} ${OUTER_C}`);
+
+    const fillFracW = Math.min(week / 100, 1);
+    el("inner-fill").setAttribute("stroke", cw);
+    el("inner-fill").setAttribute("stroke-dasharray", `${fillFracW * INNER_C} ${INNER_C}`);
+
+    // Spokes
+    const s5 = spokeCoords(100, 100, OUTER_R, pace5, 9);
+    el("outer-spoke").setAttribute("x1", s5.x1);
+    el("outer-spoke").setAttribute("y1", s5.y1);
+    el("outer-spoke").setAttribute("x2", s5.x2);
+    el("outer-spoke").setAttribute("y2", s5.y2);
+    const sw = spokeCoords(100, 100, INNER_R, pacew, 8);
+    el("inner-spoke").setAttribute("x1", sw.x1);
+    el("inner-spoke").setAttribute("y1", sw.y1);
+    el("inner-spoke").setAttribute("x2", sw.x2);
+    el("inner-spoke").setAttribute("y2", sw.y2);
+
+    // Verdict + numbers
+    el("verdict").textContent = verdictWord(delta5);
+    el("verdict").setAttribute("fill", c5);
+    el("big-num").textContent = fmtTimeLeft(pace5);
+    el("big-num").setAttribute("fill", c5);
+    el("footer-line").textContent = `${five}%  ·  wk ${week}%`;
+  }
+
+  ["five", "pace5", "week", "pacew"].forEach(id => {
+    el(id).addEventListener("input", update);
+  });
+  update();
+})();
+</script>
+</body>
+</html>
