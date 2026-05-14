@@ -47,6 +47,15 @@ After install (see below), register the statusline by adding this to `~/.claude/
 
 Restart any active `claude` TUI sessions. The first refresh writes `~/.claude/state/rate-limits.json` and the overlay starts showing real numbers.
 
+## Getting it out of the way
+
+The widget pins to the top-right of your rightmost monitor — exactly where macOS menu-bar dropdowns and Spotlight render. To free that area:
+
+- **Right-click the widget** → collapses to a tiny urgency-colored dot. The dot still pulses with the live 5-hour color, so it's not blind.
+- **Click the dot** → expands back to the full meter.
+
+The dot is 22px and leaves plenty of room for menu items, Spotlight, and notification flyouts.
+
 ## Where the numbers come from
 
 claude-meter does **not** estimate. It reads the same numbers Claude Code's own `/usage` panel shows you, via a statusline hook:
