@@ -23,6 +23,8 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QWidget
 
+from PyQt5.QtCore import QEvent  # noqa: E402  — grouped after QWidget on purpose
+
 from claude_meter import config, counter
 from claude_meter.mac_window import make_always_visible
 
@@ -33,6 +35,10 @@ class MeterWidget(QWidget):
     WIDTH = SIZE + SIDE_PANEL
     HEIGHT = SIZE
     MARGIN_FROM_EDGE = 14
+    # Collapsed-dot mode: shrinks the widget to a tiny circle that still
+    # shows the 5h urgency hue. Right-click toggles. Single-click on the
+    # dot expands back.
+    DOT_SIZE = 22
     BASE_RING_THICKNESS = 9
     MAX_RING_THICKNESS = 14
     MIN_RING_THICKNESS = 6
@@ -53,6 +59,8 @@ class MeterWidget(QWidget):
         self._five_hour: counter.WindowStats | None = None
         self._weekly: counter.WindowStats | None = None
         self._burn_tpm: float = 0.0  # recent burn rate (last 5 min)
+        self._collapsed: bool = False
+        self._official: dict | None = None
 
         self._position_top_right_external()
 
@@ -81,9 +89,42 @@ class MeterWidget(QWidget):
         screens = app.screens()
         target = max(screens, key=lambda s: s.geometry().x())
         geo = target.availableGeometry()
-        x = geo.right() - self.WIDTH - self.MARGIN_FROM_EDGE
+        if self._collapsed:
+            w = self.DOT_SIZE
+        else:
+            w = self.WIDTH
+        x = geo.right() - w - self.MARGIN_FROM_EDGE
         y = geo.top() + self.MARGIN_FROM_EDGE
         self.move(x, y)
+
+    # ------------------------------------------------------------------
+    # Collapse / expand
+    # ------------------------------------------------------------------
+
+    def _set_collapsed(self, collapsed: bool) -> None:
+        """Toggle between full meter and a tiny urgency-colored dot."""
+        if collapsed == self._collapsed:
+            return
+        self._collapsed = collapsed
+        if collapsed:
+            self.setFixedSize(self.DOT_SIZE, self.DOT_SIZE)
+        else:
+            self.setFixedSize(self.WIDTH, self.HEIGHT)
+        self._position_top_right_external()
+        self.update()
+
+    def mousePressEvent(self, event):  # noqa: N802
+        # Left-click on collapsed dot → expand back.
+        # Right-click anywhere → toggle collapse.
+        if event.button() == Qt.RightButton:
+            self._set_collapsed(not self._collapsed)
+            event.accept()
+            return
+        if event.button() == Qt.LeftButton and self._collapsed:
+            self._set_collapsed(False)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def showEvent(self, event):  # noqa: N802
         super().showEvent(event)
@@ -217,6 +258,10 @@ class MeterWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
+        if self._collapsed:
+            self._paint_collapsed_dot(painter)
+            return
+
         rect = self.rect()
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(15, 17, 22, 235))
@@ -283,6 +328,34 @@ class MeterWidget(QWidget):
 
         self._draw_center_text(painter, frac5, fracw, delta5, deltaw)
         self._draw_side_panel(painter, frac5, fracw, delta5, deltaw)
+
+    def _paint_collapsed_dot(self, painter):
+        """Tiny circle showing the 5h urgency hue. Pulses gently when in danger."""
+        rect = self.rect()
+        # Pick color from the live data if we have it; otherwise a neutral hue.
+        if self._five_hour is not None and self._official:
+            frac5 = self._official_pct("five_hour") or 0.0
+            pace5 = self._pace_position(config.FIVE_HOUR_WINDOW)
+            delta5 = self._pace_delta(min(frac5, 1.0), pace5)
+            color = self._verdict_color(delta5, "5h")
+        else:
+            color = QColor(150, 150, 170, 220)
+
+        # Halo — pulse intensity scales with overpace
+        pulse = (math.sin(self._anim_phase * 1.5) + 1) / 2  # 0..1
+        halo = QColor(color)
+        halo.setAlpha(int(70 + 60 * pulse))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(halo)
+        painter.drawEllipse(rect)
+
+        # Solid inner dot
+        inner = rect.adjusted(4, 4, -4, -4)
+        bright = QColor(min(color.red() + 30, 255),
+                        min(color.green() + 30, 255),
+                        min(color.blue() + 30, 255), 255)
+        painter.setBrush(bright)
+        painter.drawEllipse(inner)
 
     def _draw_waiting_state(self, painter):
         """Render when no live rate-limit data is available.
