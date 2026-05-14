@@ -597,19 +597,27 @@ class MeterWidget(QWidget):
             y_lbl = row_top + i * row_h
             y_track = y_lbl + 22
 
-            # Icon (no words) — sits left of the track
+            # Icon + short scope label (kept small but explicit — "5h" / "wk")
             self._draw_pair_icon(painter, icon, x_lbl, y_lbl - 4, color)
+            scope_font = QFont("Helvetica Neue")
+            scope_font.setPointSize(9)
+            scope_font.setBold(True)
+            painter.setFont(scope_font)
+            painter.setPen(QColor(255, 255, 255, 220))
+            scope_text = "5h" if icon == "clock" else "wk"
+            painter.drawText(x_lbl + 20, y_lbl + 8, scope_text)
 
-            # Track (rail)
+            # Track (rail) — pushed further right to accommodate the scope word
+            rail_offset = 46
             track_pen = QPen(QColor(255, 255, 255, 55))
             track_pen.setWidth(4)
             track_pen.setCapStyle(Qt.RoundCap)
             painter.setPen(track_pen)
-            painter.drawLine(x_track + 24, y_track,
-                             x_track + 24 + track_w - 24, y_track)
+            painter.drawLine(x_track + rail_offset, y_track,
+                             x_track + rail_offset + track_w - rail_offset, y_track)
 
-            track_left  = x_track + 24
-            track_right = track_left + (track_w - 24)
+            track_left  = x_track + rail_offset
+            track_right = track_left + (track_w - rail_offset)
             track_span  = track_right - track_left
 
             fill_x = int(track_left + min(fill_v, 1.0) * track_span)
@@ -888,9 +896,17 @@ class MeterWidget(QWidget):
 
         color5 = self._verdict_color(delta5, "5h")
 
-        # 1. Big number = time left in the 5h window (the actionable metric)
+        # Center stack — slightly smaller than before, with the 5h budget %
+        # alongside the time so you read both at a glance.
+        #
+        # Layout (centered on cx, anchored above/below cy):
+        #
+        #             4h 43m         ← big, color-matched (time left in window)
+        #          ── 5h · 38% ──     ← caption: scope and budget %
+        #             ON PACE         ← verdict word
+        #
         big_font = QFont("Helvetica Neue")
-        big_font.setPointSize(24)
+        big_font.setPointSize(19)
         big_font.setBold(True)
         painter.setFont(big_font)
         painter.setPen(color5)
@@ -898,19 +914,21 @@ class MeterWidget(QWidget):
         fm = painter.fontMetrics()
         tw = fm.horizontalAdvance(win_left)
         th = fm.ascent()
-        painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 8), win_left)
+        painter.drawText(int(cx - tw / 2), int(cy + th / 2 - 10), win_left)
 
-        # 2. Caption under the big number
-        label_font = QFont("Helvetica Neue")
-        label_font.setPointSize(9)
-        painter.setFont(label_font)
-        painter.setPen(QColor(255, 255, 255, 180))  # was 130
-        lbl = "5h window left"
+        # Caption underneath: scope + budget % in one tight line
+        cap_font = QFont("Helvetica Neue")
+        cap_font.setPointSize(9)
+        cap_font.setBold(True)
+        painter.setFont(cap_font)
+        painter.setPen(QColor(255, 255, 255, 200))
+        pct_str = f"{int(round(min(frac5, 1.0) * 100))}% used"
+        cap_text = f"5h left  ·  {pct_str}"
         fm = painter.fontMetrics()
-        lw = fm.horizontalAdvance(lbl)
-        painter.drawText(int(cx - lw / 2), int(cy + th / 2 + 8), lbl)
+        lw = fm.horizontalAdvance(cap_text)
+        painter.drawText(int(cx - lw / 2), int(cy + th / 2 + 6), cap_text)
 
-        # 3. Verdict word at the bottom of the center
+        # Verdict word at the bottom of the center
         verdict_font = QFont("Helvetica Neue")
         verdict_font.setPointSize(11)
         verdict_font.setBold(True)
@@ -919,7 +937,7 @@ class MeterWidget(QWidget):
         word = self._verdict_word(delta5)
         fm = painter.fontMetrics()
         vw = fm.horizontalAdvance(word)
-        painter.drawText(int(cx - vw / 2), int(cy + th / 2 + 28), word)
+        painter.drawText(int(cx - vw / 2), int(cy + th / 2 + 26), word)
 
 
 def main() -> int:
