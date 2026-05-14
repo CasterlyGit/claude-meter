@@ -9,10 +9,8 @@ class PlanLimits:
     """Approximate token ceilings per Claude plan tier.
 
     Calibrated against the in-app "% used" gauges shown by Claude Code itself.
-    On 2026-05-14, with 11.9M billed tokens reported as 49% of the 5-hour
-    window and 5% of the weekly window, the implied ceilings are:
-      - 5-hour:  ~24.3M tokens
-      - weekly:  ~238M tokens
+    2026-05-14 recalibration: 23.0M billed tokens = 71% per app, so the 5h
+    ceiling for Max 20x is ≈ 32.4M. Weekly ceiling assumed to scale similarly.
 
     Edit these if your in-app gauges deviate. The point is "look at the bar,
     don't look at the absolute numbers" — calibration is loose by design.
@@ -26,7 +24,7 @@ class PlanLimits:
 PLANS = {
     "pro": PlanLimits("Claude Pro", 1_200_000, 12_000_000),
     "max-5x": PlanLimits("Claude Max 5x", 6_000_000, 60_000_000),
-    "max-20x": PlanLimits("Claude Max 20x", 24_300_000, 238_000_000),
+    "max-20x": PlanLimits("Claude Max 20x", 32_400_000, 320_000_000),
     "console": PlanLimits("Console API", 999_999_999, 999_999_999),
 }
 

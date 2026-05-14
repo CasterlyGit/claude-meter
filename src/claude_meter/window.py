@@ -81,10 +81,30 @@ class MeterWidget(QWidget):
             now = counter.now_utc()
             self._five_hour = counter.stats_for_window(now, config.FIVE_HOUR_WINDOW)
             self._weekly = counter.stats_for_window(now, config.WEEKLY_WINDOW)
-            self._burn_tpm = counter.burn_rate_last_n_minutes(now, 5.0)
+            self._burn_tpm = counter.burn_rate_last_n_minutes(now, 30.0)
+            self._official = counter.read_official_rate_limits()
         except Exception:
             return
         self.update()
+
+    def _official_pct(self, key: str) -> float | None:
+        """Return five_hour or seven_day percentage from Claude's own data."""
+        if not self._official:
+            return None
+        rl = (self._official or {}).get("rate_limits") or {}
+        block = rl.get(key)
+        if not block:
+            return None
+        return float(block.get("used_percentage", 0.0)) / 100.0
+
+    def _official_resets_at(self, key: str) -> str | None:
+        if not self._official:
+            return None
+        rl = (self._official or {}).get("rate_limits") or {}
+        block = rl.get(key)
+        if not block:
+            return None
+        return block.get("resets_at")
 
     # ---- color = pace-vs-actual delta ----
     # The dominant fill color tells you whether you're burning faster than
@@ -195,8 +215,18 @@ class MeterWidget(QWidget):
             return
 
         limits = config.active_limit()
-        raw5 = self._five_hour.billed_tokens / max(limits.five_hour_ceiling, 1)
-        raww = self._weekly.billed_tokens / max(limits.weekly_ceiling, 1)
+
+        # Prefer Claude's own gauge values if the statusline hook captured them
+        official5 = self._official_pct("five_hour")
+        officialw = self._official_pct("seven_day")
+        if official5 is not None:
+            raw5 = official5
+        else:
+            raw5 = self._five_hour.billed_tokens / max(limits.five_hour_ceiling, 1)
+        if officialw is not None:
+            raww = officialw
+        else:
+            raww = self._weekly.billed_tokens / max(limits.weekly_ceiling, 1)
         frac5 = min(raw5, 1.0)
         fracw = min(raww, 1.0)
 
@@ -234,7 +264,52 @@ class MeterWidget(QWidget):
             burn_tpm=0.0,
         )
 
+        # Draw the pace markers ON TOP of the fill arcs — radial spokes
+        # that stick out past the ring so they're visible regardless of
+        # where the fill currently ends.
+        self._draw_pace_marker(painter, outer_rect, t5, pace5)
+        self._draw_pace_marker(painter, inner_rect, tw, pacew)
+
         self._draw_center_text(painter, frac5, fracw, delta5, deltaw)
+
+    def _draw_pace_marker(self, painter, rect_tuple, thickness, pace):
+        """A radial spoke crossing the ring track perpendicular to it.
+
+        Drawn AFTER the fill arc so it's always on top. Extends slightly
+        beyond the ring on both sides for max visibility.
+        """
+        if pace <= 0:
+            return
+        x, y, w, h = rect_tuple
+        # Center of the ring
+        cx_local = x + w / 2.0
+        cy_local = y + h / 2.0
+        # Ring radius (mid-line of the stroke)
+        r = w / 2.0
+        # Angle in radians; 12 o'clock = -pi/2 in Qt screen coords
+        # (Y grows downward, so we use -sin for the upward direction)
+        angle_deg = 90 - 360 * pace  # clockwise from 12
+        angle_rad = math.radians(angle_deg)
+        # Inner/outer endpoints of the spoke
+        half = thickness / 2.0 + 3  # extends 3px past the ring on each side
+        x1 = cx_local + math.cos(angle_rad) * (r - half)
+        y1 = cy_local - math.sin(angle_rad) * (r - half)
+        x2 = cx_local + math.cos(angle_rad) * (r + half)
+        y2 = cy_local - math.sin(angle_rad) * (r + half)
+
+        # Bright white spoke with a thin dark outline for contrast against
+        # both the fill color AND the track.
+        pen_outline = QPen(QColor(0, 0, 0, 200))
+        pen_outline.setWidth(4)
+        pen_outline.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen_outline)
+        painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+        pen_line = QPen(QColor(255, 255, 255, 255))
+        pen_line.setWidth(2)
+        pen_line.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen_line)
+        painter.drawLine(int(x1), int(y1), int(x2), int(y2))
 
     def _draw_loaded_ring(
         self,
@@ -259,21 +334,9 @@ class MeterWidget(QWidget):
         painter.setPen(track_pen)
         painter.drawArc(x, y, w, h, 0, 360 * 16)
 
-        # --- pace marker (feature 1) ---
-        # A bright contrasting wedge on the track at the "where you should be"
-        # position. Bright white, ~4° wide so it's unmistakable but not loud.
-        if pace > 0:
-            tick_angle_deg = 90 - 360 * pace
-            tick_pen = QPen(QColor(255, 255, 255, 235))
-            tick_pen.setWidth(thickness + 2)  # slightly wider than the ring itself
-            tick_pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(tick_pen)
-            # Center the wedge on the tick angle: start 2° earlier, span 4°
-            painter.drawArc(
-                x, y, w, h,
-                int((tick_angle_deg + 2) * 16),
-                int(-4 * 16),
-            )
+        # NOTE: pace marker is drawn AFTER the fill arc (in _draw_pace_marker)
+        # so it stays visible regardless of fill state. Skipped here.
+        pass
 
         if frac <= 0:
             return

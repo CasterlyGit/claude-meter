@@ -9,6 +9,32 @@ from typing import Iterator
 
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+RATE_LIMITS_FILE = Path.home() / ".claude" / "state" / "rate-limits.json"
+
+
+def read_official_rate_limits() -> dict | None:
+    """Return the rate-limits dict Claude Code itself reports, or None.
+
+    Lives at ~/.claude/state/rate-limits.json (populated by the statusline
+    hook). Shape:
+        {
+          "captured_at": "2026-05-14T07:34:39Z",
+          "rate_limits": {
+            "five_hour": {"used_percentage": 71.0, "resets_at": "..."},
+            "seven_day": {"used_percentage": 8.5, "resets_at": "..."}
+          },
+          ...
+        }
+
+    Treated as authoritative — these are the numbers the in-app gauge shows.
+    """
+    if not RATE_LIMITS_FILE.exists():
+        return None
+    try:
+        with RATE_LIMITS_FILE.open() as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 @dataclass(frozen=True)
