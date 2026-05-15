@@ -158,9 +158,19 @@ class MeterWidget(QWidget):
             )
             self._refresh_pending = True
             self._refresh_baseline_ts = (self._official or {}).get("captured_at") if self._official else None
+            # Safety: clear the pending flag after 30s even if the file never
+            # updates (e.g. refresh script failed silently). Otherwise the
+            # button would stay disabled forever.
+            QTimer.singleShot(30_000, self._clear_refresh_pending)
             self.update()
         except Exception:
             pass
+
+    def _clear_refresh_pending(self) -> None:
+        if self._refresh_pending:
+            self._refresh_pending = False
+            self._refresh_baseline_ts = None
+            self.update()
 
     def mousePressEvent(self, event):  # noqa: N802
         # When expanded, a click in the top-right chevron toggles collapse.
@@ -522,13 +532,17 @@ class MeterWidget(QWidget):
 
     def _draw_refresh_button(self, painter):
         """Circular-arrow refresh icon, left of the chevron. Click =
-        explicit token-spending refresh of the rate-limits file."""
+        explicit token-spending refresh of the rate-limits file.
+        Greyed out while a refresh is in flight (clicks are no-ops then)."""
         import math as _m
         rect = self._refresh_rect()
-        # background hit target
+        pending = self._refresh_pending
+
+        # background hit target — dimmer + flatter when disabled (pending),
+        # normal when idle. Was previously *brighter* while pending which
+        # made the disabled state look more inviting; reversed it.
         painter.setPen(Qt.NoPen)
-        # brighter when pending so the user knows the click registered
-        bg_alpha = 90 if self._refresh_pending else 26
+        bg_alpha = 14 if pending else 36
         painter.setBrush(QColor(255, 255, 255, bg_alpha))
         painter.drawEllipse(rect)
 
@@ -536,20 +550,19 @@ class MeterWidget(QWidget):
         cy = rect.y() + rect.height() / 2
         r = (rect.width() / 2) - 5
 
-        # circular-arrow stroke
-        spin = self._anim_phase if self._refresh_pending else 0.0
-        pen = QPen(QColor(230, 230, 240, 230))
+        # Stroke + arrowhead alpha
+        stroke_alpha = 90 if pending else 230
+        spin = self._anim_phase if pending else 0.0
+        pen = QPen(QColor(230, 230, 240, stroke_alpha))
         pen.setWidth(2)
         pen.setCapStyle(Qt.RoundCap)
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
-        # Arc spanning ~300°, leaving a gap for the arrowhead
         start_deg = int((90 + (180 / _m.pi) * spin) * 16)
         span_deg = -int(300 * 16)
         painter.drawArc(int(cx - r), int(cy - r), int(r * 2), int(r * 2),
                         start_deg, span_deg)
 
-        # arrowhead at the end of the arc
         end_rad = _m.radians(90 + (180 / _m.pi) * spin - 300)
         tip_x = cx + r * _m.cos(end_rad)
         tip_y = cy - r * _m.sin(end_rad)
