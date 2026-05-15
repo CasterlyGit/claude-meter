@@ -63,6 +63,10 @@ class MeterWidget(QWidget):
         self._burn_tpm: float = 0.0  # recent burn rate (last 5 min)
         self._collapsed: bool = False
         self._official: dict | None = None
+        # Set true while the refresh script is in flight; cleared when the
+        # rate-limits file picks up a newer captured_at than this snapshot.
+        self._refresh_pending: bool = False
+        self._refresh_baseline_ts: str | None = None
 
         self._position_top_right_external()
 
@@ -125,6 +129,39 @@ class MeterWidget(QWidget):
             self.CHEV_SIZE,
         )
 
+    def _refresh_rect(self):
+        """Rect of the refresh button — sits to the LEFT of the chevron."""
+        from PyQt5.QtCore import QRect
+        return QRect(
+            self.WIDTH - 2 * self.CHEV_SIZE - 2 * self.CHEV_MARGIN,
+            self.CHEV_MARGIN,
+            self.CHEV_SIZE,
+            self.CHEV_SIZE,
+        )
+
+    def _run_refresh(self) -> None:
+        """Spawn the refresh script asynchronously. Costs ~50 tokens — only
+        runs on explicit user click of the refresh button."""
+        import subprocess
+        from pathlib import Path
+        if self._refresh_pending:
+            return  # already in-flight; don't double-spend tokens
+        script = Path.home() / ".claude" / "scripts" / "refresh-rate-limits.sh"
+        if not script.exists():
+            return
+        try:
+            subprocess.Popen(
+                ["/bin/bash", str(script)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self._refresh_pending = True
+            self._refresh_baseline_ts = (self._official or {}).get("captured_at") if self._official else None
+            self.update()
+        except Exception:
+            pass
+
     def mousePressEvent(self, event):  # noqa: N802
         # When expanded, a click in the top-right chevron toggles collapse.
         # When collapsed, a click anywhere on the dot expands.
@@ -142,6 +179,10 @@ class MeterWidget(QWidget):
                 self._set_collapsed(True)
                 event.accept()
                 return
+            if self._refresh_rect().contains(event.pos()):
+                self._run_refresh()
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def showEvent(self, event):  # noqa: N802
@@ -157,6 +198,13 @@ class MeterWidget(QWidget):
             self._official = counter.read_official_rate_limits()
         except Exception:
             return
+        # If a refresh was in flight, clear the pending flag once we see a
+        # newer captured_at than the baseline snapshot taken at click time.
+        if self._refresh_pending:
+            cur_ts = (self._official or {}).get("captured_at") if self._official else None
+            if cur_ts and cur_ts != self._refresh_baseline_ts:
+                self._refresh_pending = False
+                self._refresh_baseline_ts = None
         self.update()
 
     def _official_pct(self, key: str) -> float | None:
@@ -392,6 +440,7 @@ class MeterWidget(QWidget):
         self._draw_center_text(painter, frac5, fracw, delta5, deltaw)
         self._draw_side_panel(painter, frac5, fracw, delta5, deltaw)
         self._draw_collapse_chevron(painter)
+        self._draw_refresh_button(painter)
 
     def _draw_ring_pct(self, painter, rect_tuple, frac, color, label):
         """Small color-matched percentage label sitting just inside the leading
@@ -406,18 +455,17 @@ class MeterWidget(QWidget):
         cx = x + w / 2.0
         cy = y + h / 2.0
 
-        # Both pills sit INSIDE their ring band, mirrored vertically — outer
-        # tucked just below its top edge (12 o'clock area), inner just above
-        # its bottom edge (6 o'clock area). Symmetric, no outside-of-ring
-        # protrusion.
+        # Both pills sit BELOW the bottom edge of their ring, stacked.
+        # Outer (5h) goes just below the outer ring; inner (wk) just below
+        # the inner ring. Same visual placement style.
         is_outer = (label == "5h")
         if is_outer:
             tx = cx
-            ty = y + 12          # below the top edge of the outer ring
-            anchor_top = False   # ty is the TOP of the pill
+            ty = y + h - 24      # just inside the bottom of the outer ring
+            anchor_top = False
         else:
             tx = cx
-            ty = y + h + 12
+            ty = y + h + 12      # just below the bottom of the inner ring
             anchor_top = False
 
         pct_text = f"{int(round(frac * 100))}%"
@@ -471,6 +519,48 @@ class MeterWidget(QWidget):
                          int(cx + s - 1), int(cy))
         painter.drawLine(int(cx + s - 1), int(cy),
                          int(cx - s + 1), int(cy + s))
+
+    def _draw_refresh_button(self, painter):
+        """Circular-arrow refresh icon, left of the chevron. Click =
+        explicit token-spending refresh of the rate-limits file."""
+        import math as _m
+        rect = self._refresh_rect()
+        # background hit target
+        painter.setPen(Qt.NoPen)
+        # brighter when pending so the user knows the click registered
+        bg_alpha = 90 if self._refresh_pending else 26
+        painter.setBrush(QColor(255, 255, 255, bg_alpha))
+        painter.drawEllipse(rect)
+
+        cx = rect.x() + rect.width() / 2
+        cy = rect.y() + rect.height() / 2
+        r = (rect.width() / 2) - 5
+
+        # circular-arrow stroke
+        spin = self._anim_phase if self._refresh_pending else 0.0
+        pen = QPen(QColor(230, 230, 240, 230))
+        pen.setWidth(2)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        # Arc spanning ~300°, leaving a gap for the arrowhead
+        start_deg = int((90 + (180 / _m.pi) * spin) * 16)
+        span_deg = -int(300 * 16)
+        painter.drawArc(int(cx - r), int(cy - r), int(r * 2), int(r * 2),
+                        start_deg, span_deg)
+
+        # arrowhead at the end of the arc
+        end_rad = _m.radians(90 + (180 / _m.pi) * spin - 300)
+        tip_x = cx + r * _m.cos(end_rad)
+        tip_y = cy - r * _m.sin(end_rad)
+        head_a = end_rad + _m.pi / 2 + 0.5
+        head_b = end_rad + _m.pi / 2 - 0.5
+        ah1_x = tip_x + 4 * _m.cos(head_a)
+        ah1_y = tip_y - 4 * _m.sin(head_a)
+        ah2_x = tip_x + 4 * _m.cos(head_b)
+        ah2_y = tip_y - 4 * _m.sin(head_b)
+        painter.drawLine(int(tip_x), int(tip_y), int(ah1_x), int(ah1_y))
+        painter.drawLine(int(tip_x), int(tip_y), int(ah2_x), int(ah2_y))
 
     def _paint_collapsed_dot(self, painter):
         """Tiny circle showing the 5h urgency hue. Pulses gently when in danger."""
