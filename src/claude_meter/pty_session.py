@@ -100,9 +100,11 @@ class PtySession:
         self._drain_thread = threading.Thread(target=self._drain, daemon=True)
         self._drain_thread.start()
 
-        # Give the TUI a moment to come up. We don't need to wait for the
-        # full ready prompt — the first refresh tick can be slow.
-        time.sleep(0.5)
+        # The TUI takes several seconds to finish booting (auth check, plugin
+        # sync, splash screen). If we write to the pty during boot, the input
+        # gets discarded — the TUI hasn't started reading stdin yet. Block
+        # until the boot grace period elapses.
+        time.sleep(6.0)
         return True
 
     def _drain(self) -> None:
