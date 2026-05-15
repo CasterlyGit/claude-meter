@@ -105,6 +105,23 @@ class PtySession:
         # gets discarded — the TUI hasn't started reading stdin yet. Block
         # until the boot grace period elapses.
         time.sleep(6.0)
+
+        # Newer Claude Code versions open with a "Is this a project you
+        # trust?" dialog the first time they see a given cwd. The default
+        # selection is "Yes, I trust this folder" — pressing Enter accepts
+        # it, which is exactly what a human would do when they spawned this
+        # TUI to look at the rate-limit numbers. Without this, the TUI sits
+        # on the dialog forever and the statusline never fires, so refresh
+        # clicks accomplish nothing. We send a couple of carriage returns
+        # spaced out: harmless no-ops in chat (just empty submits) if no
+        # dialog is present, dismisses the dialog if it is.
+        try:
+            os.write(fd, b"\r")
+            time.sleep(0.8)
+            os.write(fd, b"\r")
+        except OSError:
+            pass
+
         return True
 
     def _drain(self) -> None:
