@@ -406,16 +406,16 @@ class MeterWidget(QWidget):
         cx = x + w / 2.0
         cy = y + h / 2.0
 
-        # Outer ring => sits just outside the top, inner ring => below center
+        # Both pills sit INSIDE their ring band, mirrored vertically — outer
+        # tucked just below its top edge (12 o'clock area), inner just above
+        # its bottom edge (6 o'clock area). Symmetric, no outside-of-ring
+        # protrusion.
         is_outer = (label == "5h")
         if is_outer:
-            # Above the ring, slightly outside it. Hidden by the center stack
-            # if it overlaps, so keep it small.
             tx = cx
-            ty = y - 2
-            anchor_top = True
+            ty = y + 12          # below the top edge of the outer ring
+            anchor_top = False   # ty is the TOP of the pill
         else:
-            # Place inside the ring, below center, ABOVE the inner ring's track.
             tx = cx
             ty = y + h + 12
             anchor_top = False
