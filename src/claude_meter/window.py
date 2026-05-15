@@ -67,6 +67,10 @@ class MeterWidget(QWidget):
         # rate-limits file picks up a newer captured_at than this snapshot.
         self._refresh_pending: bool = False
         self._refresh_baseline_ts: str | None = None
+        # Tracks whether the in-flight refresh has already been retried via
+        # a pty recycle. Prevents an infinite respawn loop if the new TUI
+        # also fails to fire the statusline.
+        self._refresh_recycled: bool = False
 
         self._position_top_right_external()
 
@@ -154,20 +158,41 @@ class MeterWidget(QWidget):
         if not ok:
             return
         self._refresh_pending = True
+        self._refresh_recycled = False
         self._refresh_baseline_ts = (self._official or {}).get("captured_at") if self._official else None
         # Poll the file aggressively while the refresh is in flight so the
         # spinner clears as soon as the file actually updates.
         for delay_ms in (800, 1600, 2400, 3200, 4500, 6000, 8000, 11000, 14000):
             QTimer.singleShot(delay_ms, self._refresh_data)
-        # Safety: hard-clear the pending flag after 15s if the file still
-        # hasn't moved (TUI died, no network, etc).
-        QTimer.singleShot(15_000, self._clear_refresh_pending)
+        # If after ~7s the file still hasn't picked up a new captured_at,
+        # the TUI is alive-but-wedged: recycle it and resend the prompt.
+        QTimer.singleShot(7_000, self._maybe_recycle_pty)
+        # Second post-recycle poll window so the spinner clears the moment
+        # the respawned TUI's first statusline tick hits the file.
+        for delay_ms in (9000, 11000, 13000, 16000, 19000, 22000):
+            QTimer.singleShot(delay_ms, self._refresh_data)
+        # Safety: hard-clear the pending flag after 25s even if recycle
+        # also failed (no network, auth broken, etc).
+        QTimer.singleShot(25_000, self._clear_refresh_pending)
         self.update()
+
+    def _maybe_recycle_pty(self) -> None:
+        """If the refresh is still pending after the first window, the TUI
+        is wedged. Force-respawn it once and resend."""
+        if not self._refresh_pending or self._refresh_recycled:
+            return
+        self._refresh_recycled = True
+        from . import pty_session
+        try:
+            pty_session.recycle()
+        except Exception:
+            pass
 
     def _clear_refresh_pending(self) -> None:
         if self._refresh_pending:
             self._refresh_pending = False
             self._refresh_baseline_ts = None
+            self._refresh_recycled = False
             self.update()
 
     def mousePressEvent(self, event):  # noqa: N802
@@ -181,6 +206,11 @@ class MeterWidget(QWidget):
         if event.button() == Qt.LeftButton:
             if self._collapsed:
                 self._set_collapsed(False)
+                # Expanding from the dot also kicks a refresh — the user is
+                # coming back to look at the numbers, so re-fetch like a
+                # reload click would. Cheap (~half a cent) and matches the
+                # mental model that "showing me the meter again" = fresh data.
+                self._run_refresh()
                 event.accept()
                 return
             if self._chev_rect().contains(event.pos()):
@@ -213,6 +243,7 @@ class MeterWidget(QWidget):
             if cur_ts and cur_ts != self._refresh_baseline_ts:
                 self._refresh_pending = False
                 self._refresh_baseline_ts = None
+                self._refresh_recycled = False
         self.update()
 
     def _official_pct(self, key: str) -> float | None:

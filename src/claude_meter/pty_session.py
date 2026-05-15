@@ -184,6 +184,18 @@ def refresh() -> bool:
     return get_session().send_prompt("ok")
 
 
+def recycle() -> bool:
+    """Force-kill the current pty TUI and respawn a fresh one, then send 'ok'.
+    Used to recover when the TUI is alive-but-wedged (PID exists but the
+    statusline hook stops firing on input) — `is_alive()` can't catch that
+    because the process is still technically running."""
+    global _SESSION
+    if _SESSION is not None:
+        _SESSION.shutdown()
+        _SESSION = None
+    return get_session().send_prompt("ok")
+
+
 def shutdown() -> None:
     """Stop the pty (called on meter exit)."""
     global _SESSION
