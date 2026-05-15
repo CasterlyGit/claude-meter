@@ -140,35 +140,29 @@ class MeterWidget(QWidget):
         )
 
     def _run_refresh(self) -> None:
-        """Spawn the refresh script asynchronously. Costs ~50 tokens — only
-        runs on explicit user click of the refresh button."""
-        import subprocess
-        from pathlib import Path
+        """Send a tiny prompt to the persistent headless claude TUI we own.
+        The TUI re-renders, the statusline hook fires, the rate-limits file
+        updates within ~5 seconds. First click is slow (~5s cold pty boot);
+        subsequent clicks are ~1-2s because the TUI is already running."""
+        from . import pty_session
         if self._refresh_pending:
             return  # already in-flight; don't double-spend tokens
-        script = Path.home() / ".claude" / "scripts" / "refresh-rate-limits.sh"
-        if not script.exists():
-            return
         try:
-            subprocess.Popen(
-                ["/bin/bash", str(script)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            self._refresh_pending = True
-            self._refresh_baseline_ts = (self._official or {}).get("captured_at") if self._official else None
-            # Poll the file aggressively for ~15s while refresh is in flight,
-            # so we notice the update immediately instead of waiting for the
-            # next 5s scheduled tick.
-            for delay_ms in (800, 1600, 2400, 3200, 4500, 6000, 8000, 11000, 14000):
-                QTimer.singleShot(delay_ms, self._refresh_data)
-            # Safety: hard-clear the pending flag after 15s if the file
-            # still hasn't moved (script failed silently, no network, etc).
-            QTimer.singleShot(15_000, self._clear_refresh_pending)
-            self.update()
+            ok = pty_session.refresh()
         except Exception:
-            pass
+            ok = False
+        if not ok:
+            return
+        self._refresh_pending = True
+        self._refresh_baseline_ts = (self._official or {}).get("captured_at") if self._official else None
+        # Poll the file aggressively while the refresh is in flight so the
+        # spinner clears as soon as the file actually updates.
+        for delay_ms in (800, 1600, 2400, 3200, 4500, 6000, 8000, 11000, 14000):
+            QTimer.singleShot(delay_ms, self._refresh_data)
+        # Safety: hard-clear the pending flag after 15s if the file still
+        # hasn't moved (TUI died, no network, etc).
+        QTimer.singleShot(15_000, self._clear_refresh_pending)
+        self.update()
 
     def _clear_refresh_pending(self) -> None:
         if self._refresh_pending:
@@ -1146,6 +1140,15 @@ def main() -> int:
     app.setQuitOnLastWindowClosed(True)
     widget = MeterWidget()
     widget.show()
+    # Clean up the headless claude pty (if one was spawned) on exit so we
+    # don't leave orphan claude processes behind when the meter quits.
+    def _on_quit():
+        try:
+            from . import pty_session
+            pty_session.shutdown()
+        except Exception:
+            pass
+    app.aboutToQuit.connect(_on_quit)
     return app.exec_()
 
 
