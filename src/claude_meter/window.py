@@ -494,15 +494,15 @@ class MeterWidget(QWidget):
         cx = x + w / 2.0
         cy = y + h / 2.0
 
-        # Each pill is vertically CENTERED on its ring's 6 o'clock (the
-        # bottom-most point of the ring's bounding circle). Because the
-        # outer and inner rings are concentric, their 6 o'clock points are
-        # separated by the outer ring thickness + the ring gap, which gives
-        # the two pills natural vertical spacing without any hand-tuned
-        # offsets. The pill visually straddles the bottom arc — half above,
-        # half below — so it reads as part of the ring itself.
+        # Each pill sits embedded in the bottom arc of ITS OWN ring — like
+        # a label hanging on the ring's curve. The inner ring is smaller so
+        # its pill uses a slightly tighter inset; otherwise both follow the
+        # same pattern (a few pixels inside the bottom edge of the ring's
+        # bounding rect, which puts the pill centered on the bottom arc).
+        is_outer = (label == "5h")
         tx = cx
-        ty = y + h  # 6 o'clock of THIS ring's bounding circle
+        ty = y + h - (22 if is_outer else 16)
+        anchor_top = False
 
         pct_text = f"{int(round(frac * 100))}%"
 
