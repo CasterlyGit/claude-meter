@@ -494,17 +494,14 @@ class MeterWidget(QWidget):
         cx = x + w / 2.0
         cy = y + h / 2.0
 
-        # Each pill sits at the bottom of ITS OWN ring. Because the rings
-        # are concentric, the inner ring's bottom edge is higher on screen
-        # than the outer ring's bottom edge — so the inner (wk) pill ends
-        # up above the outer (5h) pill, matching the natural reading
-        # "outer = 5h, inner = weekly" from the rest of the widget.
+        # Each pill sits embedded in the bottom arc of ITS OWN ring — like
+        # a label hanging on the ring's curve. The inner ring is smaller so
+        # its pill uses a slightly tighter inset; otherwise both follow the
+        # same pattern (a few pixels inside the bottom edge of the ring's
+        # bounding rect, which puts the pill centered on the bottom arc).
         is_outer = (label == "5h")
         tx = cx
-        if is_outer:
-            ty = y + h + 12      # just below the bottom of the outer ring
-        else:
-            ty = y + h - 24      # just inside the bottom of the inner ring
+        ty = y + h - (22 if is_outer else 16)
         anchor_top = False
 
         pct_text = f"{int(round(frac * 100))}%"
