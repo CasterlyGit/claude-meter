@@ -158,10 +158,14 @@ class MeterWidget(QWidget):
             )
             self._refresh_pending = True
             self._refresh_baseline_ts = (self._official or {}).get("captured_at") if self._official else None
-            # Safety: clear the pending flag after 30s even if the file never
-            # updates (e.g. refresh script failed silently). Otherwise the
-            # button would stay disabled forever.
-            QTimer.singleShot(30_000, self._clear_refresh_pending)
+            # Poll the file aggressively for ~15s while refresh is in flight,
+            # so we notice the update immediately instead of waiting for the
+            # next 5s scheduled tick.
+            for delay_ms in (800, 1600, 2400, 3200, 4500, 6000, 8000, 11000, 14000):
+                QTimer.singleShot(delay_ms, self._refresh_data)
+            # Safety: hard-clear the pending flag after 15s if the file
+            # still hasn't moved (script failed silently, no network, etc).
+            QTimer.singleShot(15_000, self._clear_refresh_pending)
             self.update()
         except Exception:
             pass
