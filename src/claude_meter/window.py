@@ -494,23 +494,20 @@ class MeterWidget(QWidget):
         cx = x + w / 2.0
         cy = y + h / 2.0
 
-        # Each pill sits at the bottom of ITS OWN ring. Because the rings
-        # are concentric, the inner ring's bottom edge is higher on screen
-        # than the outer ring's bottom edge — so the inner (wk) pill ends
-        # up above the outer (5h) pill, matching the natural reading
-        # "outer = 5h, inner = weekly" from the rest of the widget.
-        is_outer = (label == "5h")
+        # Each pill is vertically CENTERED on its ring's 6 o'clock (the
+        # bottom-most point of the ring's bounding circle). Because the
+        # outer and inner rings are concentric, their 6 o'clock points are
+        # separated by the outer ring thickness + the ring gap, which gives
+        # the two pills natural vertical spacing without any hand-tuned
+        # offsets. The pill visually straddles the bottom arc — half above,
+        # half below — so it reads as part of the ring itself.
         tx = cx
-        if is_outer:
-            ty = y + h + 12      # just below the bottom of the outer ring
-        else:
-            ty = y + h - 24      # just inside the bottom of the inner ring
-        anchor_top = False
+        ty = y + h  # 6 o'clock of THIS ring's bounding circle
 
         pct_text = f"{int(round(frac * 100))}%"
 
         big_font = QFont("Helvetica Neue")
-        big_font.setPointSize(11)  # was 8
+        big_font.setPointSize(11)
         big_font.setBold(True)
         painter.setFont(big_font)
         fm = painter.fontMetrics()
@@ -522,7 +519,7 @@ class MeterWidget(QWidget):
         pill_w = pw + pad_x * 2
         pill_h = ph + pad_y * 2
         px = int(tx - pill_w / 2)
-        py = int(ty - (pill_h if anchor_top else 0))
+        py = int(ty - pill_h / 2)  # center the pill on the 6 o'clock point
 
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(15, 17, 22, 220))
