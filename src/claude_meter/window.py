@@ -250,12 +250,33 @@ class MeterWidget(QWidget):
     def _pace_position(self, window_hours: float) -> float:
         """How far through the window we are (0..1).
 
-        Used only for track-opacity ('time pressure') visualization, not for
-        the verdict — the verdict now uses the simpler 'will I hit the cap
-        before the window resets' heuristic instead.
+        Uses Anthropic's authoritative `resets_at` when present — the window
+        is fixed-slot, not rolling-from-first-use. Falls back to transcript
+        heuristic only when no live data is available.
         """
         if window_hours <= 0:
             return 0.0
+
+        # Prefer the official reset timestamp.
+        key = "five_hour" if window_hours <= 6 else "seven_day"
+        rl = (self._official or {}).get("rate_limits") or {}
+        block = rl.get(key) or {}
+        ts = block.get("resets_at")
+        if ts is not None:
+            try:
+                from datetime import datetime, timezone
+                if isinstance(ts, (int, float)):
+                    reset_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                else:
+                    reset_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                secs_left = max(0, (reset_dt - datetime.now(timezone.utc)).total_seconds())
+                total_secs = window_hours * 3600.0
+                elapsed_secs = max(0.0, total_secs - secs_left)
+                return max(0.0, min(elapsed_secs / total_secs, 1.0))
+            except Exception:
+                pass
+
+        # Fallback: transcript-based heuristic.
         stats = self._five_hour if window_hours <= 6 else self._weekly
         if stats is None or stats.earliest is None:
             return 0.0
@@ -873,10 +894,41 @@ class MeterWidget(QWidget):
         return f"{h}h {m}m"
 
     def _window_time_left(self, stats, window_hours: float) -> str:
-        """Time remaining in the rolling window before old samples age out.
+        """Time remaining until the window resets, per Anthropic's own clock.
 
-        For a 5-hour rolling window, this is (5h - age_of_earliest_sample).
+        Anthropic's "5h window" is NOT a rolling window that starts when you
+        start working — it's a fixed slot with a hard `resets_at` epoch on
+        every rate-limit response. We use that as the source of truth.
+        Falls back to the earliest-sample heuristic only when no live data.
         """
+        # Prefer the authoritative resets_at from the official block.
+        key = "five_hour" if window_hours <= 6 else "seven_day"
+        rl = (self._official or {}).get("rate_limits") or {}
+        block = rl.get(key) or {}
+        ts = block.get("resets_at")
+        if ts is not None:
+            try:
+                from datetime import datetime, timezone
+                if isinstance(ts, (int, float)):
+                    reset_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                else:
+                    reset_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                secs = max(0, int((reset_dt - datetime.now(timezone.utc)).total_seconds()))
+                if secs < 60:
+                    return f"{secs}s"
+                if secs < 3600:
+                    return f"{secs // 60}m"
+                if secs < 86400:
+                    h = secs // 3600
+                    m = (secs % 3600) // 60
+                    return f"{h}h {m}m" if m else f"{h}h"
+                d = secs // 86400
+                h = (secs % 86400) // 3600
+                return f"{d}d {h}h" if h else f"{d}d"
+            except Exception:
+                pass
+
+        # Fallback: transcript-based heuristic.
         if stats is None or stats.earliest is None:
             return f"{int(window_hours)}h"
         now = counter.now_utc()
