@@ -46,7 +46,7 @@ def _find_claude_bin() -> Optional[str]:
 class PtySession:
     """One claude TUI running inside a pty, owned by this process."""
 
-    def __init__(self, model: str = "haiku") -> None:
+    def __init__(self, model: str = "opus") -> None:
         self._model = model
         self._pid: Optional[int] = None
         self._master_fd: Optional[int] = None
