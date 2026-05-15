@@ -137,9 +137,7 @@ class PtySession:
                 if not self.spawn():
                     return False
             try:
-                # Send prompt + carriage-return (TUI input is line-buffered)
-                payload = (prompt + "\r").encode("utf-8")
-                os.write(self._master_fd, payload)
+                os.write(self._master_fd, (prompt + "\r").encode("utf-8"))
                 return True
             except OSError:
                 # pty died; try one respawn
