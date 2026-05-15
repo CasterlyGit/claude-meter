@@ -13,4 +13,12 @@ export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 # stdin from /dev/null keeps claude from waiting on user input but the
 # script-allocated PTY keeps it thinking it has a real terminal.
 
-exec /usr/bin/script -q -F /dev/null /usr/local/bin/claude </dev/null >/tmp/claude-tty-keepalive.log 2>&1
+# Newer Claude Code versions show a "Is this a project you trust?" dialog
+# on first launch in a given cwd. The default option is "Yes, I trust this
+# folder" — pressing Enter accepts it. Without this, the headless TUI sits
+# on the dialog forever and the statusline never fires, so rate-limits.json
+# freezes. We feed an initial newline (to dismiss the dialog at the same
+# trust scope a human would grant) and then keep stdin open with `cat` so
+# claude doesn't see EOF and exit. Trust scope here is identical to clicking
+# "Yes" yourself — no additional permission bypass.
+exec /usr/bin/script -q -F /dev/null /usr/local/bin/claude < <(printf '\n'; cat) >/tmp/claude-tty-keepalive.log 2>&1
