@@ -4,7 +4,7 @@
 
 A tiny always-on-top dashboard that keeps your Claude Code rate-limit windows in the corner of your eye. Two concentric rings — 5-hour outside, weekly inside — synthwave palette, every visual property doing real work. No labels cluttering the widget, no estimates: it reads the same numbers Claude Code's own `/usage` panel pulls from Anthropic.
 
-**Status:** v0.2.1 — refresh now drives a persistent headless TUI (no popup terminal), monotonic guard against stale per-session writes, collapse-to-dot, `resets_at` time, % pills inside each ring.
+**Status:** v0.2.2 — refresh now self-heals from a wedged TUI by recycling the pty and resending; expanding from the dot also kicks a refresh. Builds on v0.2.1's persistent headless TUI + monotonic write guard.
 
 ## What the rings actually say
 
