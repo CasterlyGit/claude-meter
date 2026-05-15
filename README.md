@@ -4,7 +4,7 @@
 
 A tiny always-on-top dashboard that keeps your Claude Code rate-limit windows in the corner of your eye. Two concentric rings — 5-hour outside, weekly inside — synthwave palette, every visual property doing real work. No labels cluttering the widget, no estimates: it reads the same numbers Claude Code's own `/usage` panel pulls from Anthropic.
 
-**Status:** v0.2 — refresh button, collapse-to-dot, authoritative `resets_at` time, % pills inside each ring.
+**Status:** v0.2.1 — refresh now drives a persistent headless TUI (no popup terminal), monotonic guard against stale per-session writes, collapse-to-dot, `resets_at` time, % pills inside each ring.
 
 ## What the rings actually say
 
@@ -38,11 +38,15 @@ The widget pins to the top-right of your rightmost monitor — right where macOS
 
 ## Refresh button — explicit token-spending updates
 
-The numbers only update when *something* makes an API call (terminal `claude` rendering its statusline, or you using Claude Code in a TUI). If you only use the desktop app and the VS Code extension, the file freezes and the meter shows a `stale Nm` pill.
+The numbers only update when *something* makes a Claude API call (a terminal `claude` rendering its statusline, the desktop Claude.app, or the VS Code extension). If you're working in the apps but not the terminal, the file freezes and the meter shows a `stale Nm` pill.
 
-For those moments: **click the circular-arrow button** (left of the chevron). It fires `claude --print --model haiku "ok"` once — about 160 tokens, a fraction of a cent, and a rounding error against your 5h budget. The statusline writes fresh numbers, the meter picks them up within a few seconds, the button arc spins until it does.
+For those moments: **click the circular-arrow button** (left of the chevron). The meter owns a hidden, headless `claude` TUI running inside a pseudo-terminal — no visible window, no dock icon — and the click sends one tiny prompt to it. The TUI re-renders, the statusline hook writes fresh numbers, the meter picks them up within a few seconds. First click after a meter restart cold-boots the TUI (~5–8s). Every subsequent click is fast (~1–2s) because the TUI stays warm in the background.
 
-Guards against double-spend: clicking while one refresh is already in flight is a no-op.
+Cost: roughly half a cent of Haiku tokens per click. Tiny against any 5h budget.
+
+Guards:
+- The button is **disabled while one refresh is already in flight** — can't double-spend.
+- The capture script enforces a **monotonic guard** on the rate-limits file: within a single 5h window, writes that would *lower* the recorded percentage are rejected as stale per-session echoes (multiple claude sessions can race on the same file; only the highest reading wins until window reset). When the window genuinely rolls over (`resets_at` advances), the lower value is accepted as the new baseline.
 
 ## Setup
 
@@ -121,11 +125,11 @@ src/claude_meter/
 ├── counter.py        # reads ~/.claude/projects/**/*.jsonl, aggregates usage
 ├── config.py         # plan ceilings + thresholds
 ├── mac_window.py     # NSWindow pinning shim
+├── pty_session.py    # persistent headless claude TUI for the refresh button
 ├── window.py         # the Qt widget with all the ring drawing logic
 └── __main__.py       # entry point
 scripts/
-├── capture-rate-limits.sh   # statusline hook (writes ~/.claude/state/rate-limits.json)
-├── refresh-rate-limits.sh   # one-shot prompt used by the refresh button
+├── capture-rate-limits.sh           # statusline hook with monotonic guard
 └── com.casterly.claude-meter.plist  # LaunchAgent template
 ```
 
@@ -133,7 +137,8 @@ scripts/
 
 - [x] v0.1 — two-ring layout, statusline-driven data, synthwave palette
 - [x] v0.2 — refresh button, collapse-to-dot, `resets_at`-based time, per-ring % pills, weight-graded center stack
-- [ ] Optional `ANTHROPIC_API_KEY` mode — one tiny ping/minute reads the rate-limit headers off the response. Costs roughly nothing in tokens, no terminal session needed. ([#TBD](https://github.com/CasterlyGit/claude-meter/issues))
+- [x] v0.2.1 — refresh button uses a headless pty so it actually works (no popup terminal); monotonic guard prevents stale per-session writes from flicker-overwriting fresh data
+- [ ] Optional `ANTHROPIC_API_KEY` mode — one tiny ping/minute reads the rate-limit headers off the response. Costs roughly nothing in tokens, no terminal session needed. ([#1](https://github.com/CasterlyGit/claude-meter/issues/1))
 - [ ] Multi-monitor positioning preference (currently pins to rightmost; some setups want primary)
 - [ ] Linux support — the rings draw fine on PyQt5, but the always-on-top pin uses PyObjC which is darwin-only
 - [ ] curby integration — meter overlays a tiny status puck when curby is running

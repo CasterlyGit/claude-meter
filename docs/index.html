@@ -347,8 +347,12 @@
       <p>The top-right corner has a small <strong>></strong>. Click it and the meter shrinks to a 22px urgency-colored dot in the same spot — out of the way of Spotlight and menu dropdowns, but still pulsing in your 5h color. Click the dot to expand back.</p>
     </div>
     <div class="card">
-      <h3>Refresh button — explicit, cheap</h3>
-      <p>The circular arrow next to the chevron. Click it to spend ~160 tokens (a fraction of a cent, rounding error against your 5h budget) on one tiny <code>claude --print</code> call, which forces a fresh rate-limit reading. Disabled while in flight so you can't double-spend.</p>
+      <h3>Refresh button — headless TUI</h3>
+      <p>The circular arrow next to the chevron. The meter owns a hidden <code>claude</code> TUI inside a pseudo-terminal — no popup window, no dock icon. Click it and the meter sends one tiny prompt to that warm session: about half a cent of Haiku tokens, a rounding error against your 5h budget. First click cold-boots the TUI (~6s); every subsequent click is fast (~1–2s).</p>
+    </div>
+    <div class="card">
+      <h3>Monotonic guard — no flicker</h3>
+      <p>Multiple <code>claude</code> sessions on the same machine all write rate-limit numbers to the same file, and each session sees a slightly different per-session number. Within a single 5h window, the meter only accepts writes that are equal to or higher than the current reading — stale lower numbers from idle sessions are rejected. When the window genuinely resets, the lower value is accepted as the new baseline.</p>
     </div>
     <div class="card">
       <h3>Source of truth</h3>
