@@ -277,10 +277,10 @@
                 stroke-linecap="butt" stroke-dasharray="0 999" transform="rotate(-90 100 100)" id="inner-fill" filter="url(#glow)"/>
         <line x1="100" y1="36" x2="100" y2="24" stroke="white" stroke-width="2.5" id="inner-spoke"/>
 
-        <!-- center stack: three equal-size, weight-graded lines (% USED / time / verdict) -->
+        <!-- center stack: three equal-size, weight-graded lines (% USED / verdict / time) -->
         <text x="100" y="84" text-anchor="middle" font-family="Helvetica Neue, sans-serif" font-size="11" font-weight="500" fill="#5be3c8" id="line-pct" opacity="0.78">54% USED</text>
-        <text x="100" y="104" text-anchor="middle" font-family="Helvetica Neue, sans-serif" font-size="11" font-weight="700" fill="#5be3c8" id="line-time">2h 18m</text>
-        <text x="100" y="124" text-anchor="middle" font-family="Helvetica Neue, sans-serif" font-size="11" font-weight="900" fill="#7ff0d8" id="line-verdict">ON PACE</text>
+        <text x="100" y="104" text-anchor="middle" font-family="Helvetica Neue, sans-serif" font-size="11" font-weight="900" fill="#7ff0d8" id="line-verdict">ON PACE</text>
+        <text x="100" y="124" text-anchor="middle" font-family="Helvetica Neue, sans-serif" font-size="11" font-weight="700" fill="#5be3c8" id="line-time">2h 18m</text>
 
         <!-- pills inside each ring, color-matched -->
         <g id="pill-5h">
@@ -299,13 +299,22 @@
         </g>
       </svg>
 
-      <!-- collapsed dot preview (toggled by the chevron click) -->
+      <!-- collapsed-pillar preview (toggled by the chevron click) -->
       <div id="collapsed-preview" style="display:none">
         <svg viewBox="0 0 60 60" width="60" height="60">
-          <circle cx="30" cy="30" r="22" fill="rgba(91,227,200,0.4)"/>
-          <circle cx="30" cy="30" r="14" fill="#7ff0d8"/>
+          <defs>
+            <clipPath id="cp-pillar-clip">
+              <circle cx="30" cy="30" r="22"/>
+            </clipPath>
+          </defs>
+          <!-- dark backing circle -->
+          <circle cx="30" cy="30" r="22" fill="#0f1116"/>
+          <!-- fill from the bottom up — height matches 54% used -->
+          <rect x="8" y="30" width="44" height="24" fill="#7ff0d8" clip-path="url(#cp-pillar-clip)"/>
+          <!-- urgency-colored frame -->
+          <circle cx="30" cy="30" r="22" fill="none" stroke="#5be3c8" stroke-width="2"/>
         </svg>
-        <div class="cp-caption">click the dot to expand back</div>
+        <div class="cp-caption">click the pillar to expand back</div>
       </div>
     </div>
 
@@ -343,12 +352,20 @@
       <p>Color is the gap between fill and spoke. Cyan when you're well behind the spoke, lime when on pace, soft periwinkle as you start to creep ahead, deep violet when you're well past it. No alarms — just at-a-glance answers.</p>
     </div>
     <div class="card">
-      <h3>Click the chevron, get a dot</h3>
-      <p>The top-right corner has a small <strong>></strong>. Click it and the meter shrinks to a 22px urgency-colored dot in the same spot — out of the way of Spotlight and menu dropdowns, but still pulsing in your 5h color. Click the dot to expand back.</p>
+      <h3>Click the chevron, get a progress pillar</h3>
+      <p>The top-right corner has a small <strong>></strong>. Click it and the meter shrinks to a 42px circle that <em>fills from the bottom up</em> by your 5h percentage, framed in the urgency color. Climbs visibly as you spend, so the collapsed view is enough on its own — no need to re-expand. Out of the way of Spotlight and menu dropdowns. Click the pillar to expand back.</p>
     </div>
     <div class="card">
-      <h3>Refresh button — headless TUI</h3>
+      <h3>10-minute self-refresh</h3>
+      <p>A background timer fires a refresh every 10 minutes, but <em>only</em> if the captured data has actually gone stale. If you're in an interactive Claude session that's keeping the statusline warm, the timer rides along and spends nothing. Net effect: the collapsed pillar keeps climbing whether you've expanded the widget or not.</p>
+    </div>
+    <div class="card">
+      <h3>Refresh button — instant headless TUI ping</h3>
       <p>The circular arrow next to the chevron. The meter owns a hidden <code>claude</code> TUI inside a pseudo-terminal — no popup window, no dock icon. Click it and the meter sends one tiny prompt to that warm session: about half a cent of Haiku tokens, a rounding error against your 5h budget. First click cold-boots the TUI (~6s); every subsequent click is fast (~1–2s).</p>
+    </div>
+    <div class="card">
+      <h3>Wall-clock reset times</h3>
+      <p>The left panel rails answer two questions at once: the colored fill is how much you've spent, and a small line under each rail (<code>resets 11:43 pm</code> for today's 5h, <code>resets Sun 11:43 pm</code> for the weekly) tells you the actual time the window flips. No mental arithmetic on "is that before or after dinner?".</p>
     </div>
     <div class="card">
       <h3>Monotonic guard — no flicker</h3>
@@ -496,7 +513,7 @@ claude-meter <span class="c"># overlay appears top-right of your rightmost displ
     el("inner-spoke").setAttribute("x2", sw.x2);
     el("inner-spoke").setAttribute("y2", sw.y2);
 
-    // Three-line center stack — % USED / time / verdict, all color-matched
+    // Three-line center stack — % USED / verdict / time, all color-matched
     const fiveClamped = Math.min(five, 999);
     const pctLine = el("line-pct");
     const timeLine = el("line-time");

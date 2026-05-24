@@ -1,4 +1,10 @@
-"""PyQt floating window pinned to the top-right of an external display.
+"""PyQt floating window pinned to a configurable corner of a chosen display.
+
+Default: top-left of the primary screen (the MacBook built-in display in a
+dual-monitor setup). Right-click on the meter opens a menu to pick a
+different screen or corner; the choice persists in
+``~/.claude/state/claude-meter-position.json`` so it survives restarts.
+
 
 Visual language — every property of the rings encodes information:
   * Filled arc length = % of ceiling used
@@ -15,11 +21,13 @@ app switches.
 """
 from __future__ import annotations
 
+import json
 import math
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QPoint
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QWidget
 
@@ -27,6 +35,28 @@ from PyQt5.QtCore import QEvent  # noqa: E402  — grouped after QWidget on purp
 
 from claude_meter import config, counter
 from claude_meter.mac_window import make_always_visible
+
+
+POSITION_FILE = Path.home() / ".claude" / "state" / "claude-meter-position.json"
+
+
+def _load_saved_position() -> tuple[int, int] | None:
+    """Return saved (x, y) global pos, or None if missing/corrupt."""
+    try:
+        with POSITION_FILE.open() as fh:
+            data = json.load(fh)
+        return int(data["x"]), int(data["y"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _save_position(x: int, y: int) -> None:
+    try:
+        POSITION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with POSITION_FILE.open("w") as fh:
+            json.dump({"x": int(x), "y": int(y)}, fh)
+    except OSError:
+        pass
 
 
 class MeterWidget(QWidget):
@@ -38,7 +68,7 @@ class MeterWidget(QWidget):
     WIDTH = SIZE + SIDE_PANEL
     HEIGHT = SIZE
     MARGIN_FROM_EDGE = 14
-    DOT_SIZE = 28        # bigger so it's tappable on ultrawide (was 22)
+    DOT_SIZE = 42        # bigger so the collapsed pillar-fill is legible from a glance
     CHEV_SIZE = 22
     CHEV_MARGIN = 7
     BASE_RING_THICKNESS = 13   # scaled up with SIZE
@@ -72,7 +102,12 @@ class MeterWidget(QWidget):
         # also fails to fire the statusline.
         self._refresh_recycled: bool = False
 
-        self._position_top_right_external()
+        # Drag state: stores the cursor-to-window offset while the user is
+        # dragging the meter to a new position. None = not currently dragging.
+        self._drag_origin: QPoint | None = None
+        self._drag_moved: bool = False
+
+        self._position_initial()
 
         self._data_timer = QTimer(self)
         self._data_timer.timeout.connect(self._refresh_data)
@@ -81,6 +116,16 @@ class MeterWidget(QWidget):
         self._pin_timer = QTimer(self)
         self._pin_timer.timeout.connect(lambda: make_always_visible(self))
         self._pin_timer.start(2000)
+
+        # Self-driven refresh so the meter stays live even when no
+        # interactive Claude session is firing the statusline hook. The
+        # tick only spends tokens if the captured data has actually gone
+        # stale — if a real session is keeping rate-limits.json warm we
+        # ride along for free. Fires regardless of collapsed/expanded, so
+        # the dot keeps climbing without the user expanding the widget.
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.timeout.connect(self._auto_refresh_tick)
+        self._auto_refresh_timer.start(config.AUTO_REFRESH_SECONDS * 1000)
 
         # Animation tick: drives the comet tail rotation and pace pulse
         self._anim_phase = 0.0
@@ -94,18 +139,71 @@ class MeterWidget(QWidget):
         self._anim_phase = (self._anim_phase + 0.04) % (2 * math.pi)
         self.update()
 
-    def _position_top_right_external(self) -> None:
-        app = QApplication.instance()
-        screens = app.screens()
-        target = max(screens, key=lambda s: s.geometry().x())
+    def _current_width(self) -> int:
+        return self.DOT_SIZE if self._collapsed else self.WIDTH
+
+    def _current_height(self) -> int:
+        return self.DOT_SIZE if self._collapsed else self.HEIGHT
+
+    def _position_initial(self) -> None:
+        """First placement at launch.
+
+        Prefer a saved position if it still falls inside one of the active
+        screens (so a drag survives restart). Otherwise default to the
+        top-left of the MacBook's built-in display — even when macOS has
+        marked an external as primary. The built-in is identified by name
+        (``Color LCD``, ``Built-in``, etc.); if no such screen is found we
+        fall back to the primary screen.
+        """
+        saved = _load_saved_position()
+        if saved is not None and self._point_on_any_screen(*saved):
+            self.move(*saved)
+            return
+        target = self._preferred_screen()
         geo = target.availableGeometry()
-        if self._collapsed:
-            w = self.DOT_SIZE
-        else:
-            w = self.WIDTH
-        x = geo.right() - w - self.MARGIN_FROM_EDGE
+        x = geo.left() + self.MARGIN_FROM_EDGE
         y = geo.top() + self.MARGIN_FROM_EDGE
         self.move(x, y)
+
+    def _preferred_screen(self):
+        """Return the MacBook built-in screen if attached, else primary.
+
+        macOS marks whichever display the user designated as 'Main' as
+        primary, which is often the external in a docked setup. We don't
+        want that — the user wants the meter on the laptop. Match by Qt
+        screen name: built-in displays show as ``Color LCD`` (Intel /
+        older Apple Silicon) or ``Built-in Retina Display`` (newer).
+        """
+        app = QApplication.instance()
+        for screen in app.screens():
+            name = (screen.name() or "").lower()
+            if "color lcd" in name or "built-in" in name or "builtin" in name:
+                return screen
+        return app.primaryScreen()
+
+    def _point_on_any_screen(self, x: int, y: int) -> bool:
+        """True if (x, y) is inside the available geometry of some screen.
+
+        Used to drop a stale saved position if the user has unplugged the
+        monitor it lived on. Checks the *top-left* corner of where the
+        widget would sit, plus a small inset, so we don't accept positions
+        that would render entirely off-screen.
+        """
+        app = QApplication.instance()
+        for screen in app.screens():
+            geo = screen.availableGeometry()
+            if geo.contains(x + 4, y + 4):
+                return True
+        return False
+
+    def _clamp_to_visible_screen(self) -> None:
+        """If the widget has drifted off-screen, snap it back onto a screen."""
+        pos = self.pos()
+        if self._point_on_any_screen(pos.x(), pos.y()):
+            return
+        target = self._preferred_screen()
+        geo = target.availableGeometry()
+        self.move(geo.left() + self.MARGIN_FROM_EDGE, geo.top() + self.MARGIN_FROM_EDGE)
 
     # ------------------------------------------------------------------
     # Collapse / expand
@@ -120,7 +218,9 @@ class MeterWidget(QWidget):
             self.setFixedSize(self.DOT_SIZE, self.DOT_SIZE)
         else:
             self.setFixedSize(self.WIDTH, self.HEIGHT)
-        self._position_top_right_external()
+        # Stay where the user dragged us, just nudge back on-screen if the
+        # size change pushed an edge past the screen boundary.
+        self._clamp_to_visible_screen()
         self.update()
 
     def _chev_rect(self):
@@ -188,6 +288,20 @@ class MeterWidget(QWidget):
         except Exception:
             pass
 
+    def _auto_refresh_tick(self) -> None:
+        """Background tick — fires a refresh only when the captured data is
+        actually stale enough to need one. Skips if a manual refresh is
+        already in flight (so the user clicking refresh + the timer firing
+        don't double-spend tokens)."""
+        if self._refresh_pending:
+            return
+        age = self._data_age_seconds()
+        # If there's no data yet, or it's older than ~one interval, refresh.
+        # The -30s slack lets us still refresh on time when the previous
+        # refresh landed slightly late.
+        if age is None or age >= config.AUTO_REFRESH_SECONDS - 30:
+            self._run_refresh()
+
     def _clear_refresh_pending(self) -> None:
         if self._refresh_pending:
             self._refresh_pending = False
@@ -195,33 +309,69 @@ class MeterWidget(QWidget):
             self._refresh_recycled = False
             self.update()
 
+    DRAG_THRESHOLD_PX = 4  # press+move under this is treated as a click, not a drag
+
     def mousePressEvent(self, event):  # noqa: N802
-        # When expanded, a click in the top-right chevron toggles collapse.
-        # When collapsed, a click anywhere on the dot expands.
-        # Right-click anywhere also toggles (kept for power users).
+        # Right-click toggles collapse (kept for power users).
         if event.button() == Qt.RightButton:
             self._set_collapsed(not self._collapsed)
             event.accept()
             return
         if event.button() == Qt.LeftButton:
-            if self._collapsed:
-                self._set_collapsed(False)
-                # Expanding from the dot also kicks a refresh — the user is
-                # coming back to look at the numbers, so re-fetch like a
-                # reload click would. Cheap (~half a cent) and matches the
-                # mental model that "showing me the meter again" = fresh data.
-                self._run_refresh()
-                event.accept()
-                return
-            if self._chev_rect().contains(event.pos()):
-                self._set_collapsed(True)
-                event.accept()
-                return
-            if self._refresh_rect().contains(event.pos()):
-                self._run_refresh()
-                event.accept()
-                return
+            # If the press lands on a known button hit-rect, remember it but
+            # don't start a drag yet — the action only fires on release if
+            # the user didn't actually drag. This way the user can grab any
+            # pixel of the widget (including the buttons) to drag it.
+            self._drag_origin = event.globalPos() - self.frameGeometry().topLeft()
+            self._drag_moved = False
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if self._drag_origin is None or not (event.buttons() & Qt.LeftButton):
+            super().mouseMoveEvent(event)
+            return
+        new_pos = event.globalPos() - self._drag_origin
+        delta = (new_pos - self.frameGeometry().topLeft()).manhattanLength()
+        if delta >= self.DRAG_THRESHOLD_PX:
+            self._drag_moved = True
+        if self._drag_moved:
+            self.move(new_pos)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if event.button() != Qt.LeftButton or self._drag_origin is None:
+            super().mouseReleaseEvent(event)
+            return
+        was_dragged = self._drag_moved
+        press_pos = event.pos()
+        self._drag_origin = None
+        self._drag_moved = False
+        if was_dragged:
+            pos = self.pos()
+            _save_position(pos.x(), pos.y())
+            event.accept()
+            return
+        # Not a drag — interpret as a click on whatever the cursor is over.
+        if self._collapsed:
+            self._set_collapsed(False)
+            # Expanding from the dot also kicks a refresh — the user is
+            # coming back to look at the numbers, so re-fetch like a
+            # reload click would. Cheap (~half a cent) and matches the
+            # mental model that "showing me the meter again" = fresh data.
+            self._run_refresh()
+            event.accept()
+            return
+        if self._chev_rect().contains(press_pos):
+            self._set_collapsed(True)
+            event.accept()
+            return
+        if self._refresh_rect().contains(press_pos):
+            self._run_refresh()
+            event.accept()
+            return
+        event.accept()
 
     def showEvent(self, event):  # noqa: N802
         super().showEvent(event)
@@ -494,20 +644,19 @@ class MeterWidget(QWidget):
         cx = x + w / 2.0
         cy = y + h / 2.0
 
-        # Each pill sits embedded in the bottom arc of ITS OWN ring — like
-        # a label hanging on the ring's curve. The inner ring is smaller so
-        # its pill uses a slightly tighter inset; otherwise both follow the
-        # same pattern (a few pixels inside the bottom edge of the ring's
-        # bounding rect, which puts the pill centered on the bottom arc).
-        is_outer = (label == "5h")
+        # Each pill is vertically CENTERED on its ring's 6 o'clock — the
+        # bottom-most point of the ring's bounding circle. The pill
+        # straddles the arc (half above, half below) so it reads as part
+        # of the ring itself. Vertical separation between the two pills
+        # is intrinsic: outer 6 o'clock and inner 6 o'clock differ by
+        # exactly outer-ring-thickness + ring-gap, no manual offsets.
         tx = cx
-        ty = y + h - (22 if is_outer else 16)
-        anchor_top = False
+        ty = y + h  # 6 o'clock of THIS ring's bounding circle
 
         pct_text = f"{int(round(frac * 100))}%"
 
         big_font = QFont("Helvetica Neue")
-        big_font.setPointSize(11)  # was 8
+        big_font.setPointSize(11)
         big_font.setBold(True)
         painter.setFont(big_font)
         fm = painter.fontMetrics()
@@ -519,7 +668,7 @@ class MeterWidget(QWidget):
         pill_w = pw + pad_x * 2
         pill_h = ph + pad_y * 2
         px = int(tx - pill_w / 2)
-        py = int(ty - (pill_h if anchor_top else 0))
+        py = int(ty - pill_h / 2)  # center the pill on the 6 o'clock point
 
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(15, 17, 22, 220))
@@ -602,31 +751,73 @@ class MeterWidget(QWidget):
         painter.drawLine(int(tip_x), int(tip_y), int(ah2_x), int(ah2_y))
 
     def _paint_collapsed_dot(self, painter):
-        """Tiny circle showing the 5h urgency hue. Pulses gently when in danger."""
+        """Collapsed view = a circular progress pillar.
+
+        Fills from the bottom up by the 5h % used (the metric that matters
+        minute-to-minute). Color = urgency. Deliberately *not* an Apple-style
+        edge ring — at this size a fill-from-bottom reads as 'how much you've
+        used' from across the room, the way a battery indicator does.
+        """
+        from PyQt5.QtCore import QRectF
+        from PyQt5.QtGui import QPainterPath
+
         rect = self.rect()
-        # Pick color from the live data if we have it; otherwise a neutral hue.
+        pad = 2
+        inner = rect.adjusted(pad, pad, -pad, -pad)
+
         if self._five_hour is not None and self._official:
             frac5 = self._official_pct("five_hour") or 0.0
             pace5 = self._pace_position(config.FIVE_HOUR_WINDOW)
             delta5 = self._pace_delta(min(frac5, 1.0), pace5)
             color = self._verdict_color(delta5, "5h")
+            over_pace = max(0.0, delta5)
         else:
+            frac5 = 0.0
             color = QColor(150, 150, 170, 220)
+            over_pace = 0.0
 
-        # Halo — pulse intensity scales with overpace
-        pulse = (math.sin(self._anim_phase * 1.5) + 1) / 2  # 0..1
-        halo = QColor(color)
-        halo.setAlpha(int(70 + 60 * pulse))
+        # Subtle halo only when meaningfully over-pace. Keeps the collapsed
+        # state quiet during normal use; only attention-grabs when needed.
+        if over_pace > 0.05:
+            pulse = (math.sin(self._anim_phase * (1 + over_pace * 2)) + 1) / 2
+            halo = QColor(color)
+            halo.setAlpha(int(40 + 70 * pulse * min(over_pace * 4, 1.0)))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(halo)
+            painter.drawEllipse(rect)
+
+        # Dark backing circle — gives the fill a "container" to climb into
         painter.setPen(Qt.NoPen)
-        painter.setBrush(halo)
-        painter.drawEllipse(rect)
+        painter.setBrush(QColor(15, 17, 22, 240))
+        painter.drawEllipse(inner)
 
-        # Solid inner dot
-        inner = rect.adjusted(4, 4, -4, -4)
+        # Fill from the bottom, clipped to the circle. This is the "pillar".
+        clip = QPainterPath()
+        clip.addEllipse(QRectF(inner))
+        painter.save()
+        painter.setClipPath(clip)
+
+        fill_v = max(0.0, min(frac5, 1.0))
+        fill_h = inner.height() * fill_v
+        fill_rect = QRectF(
+            float(inner.x()),
+            float(inner.bottom()) - fill_h,
+            float(inner.width()),
+            fill_h,
+        )
         bright = QColor(min(color.red() + 30, 255),
                         min(color.green() + 30, 255),
-                        min(color.blue() + 30, 255), 255)
+                        min(color.blue() + 30, 255), 245)
         painter.setBrush(bright)
+        painter.drawRect(fill_rect)
+        painter.restore()
+
+        # Crisp outer ring in the urgency color — frames the pillar without
+        # turning into an Apple-ring progress arc (it's a static frame).
+        ring_pen = QPen(color)
+        ring_pen.setWidth(2)
+        painter.setPen(ring_pen)
+        painter.setBrush(Qt.NoBrush)
         painter.drawEllipse(inner)
 
     def _draw_waiting_state(self, painter):
@@ -690,6 +881,32 @@ class MeterWidget(QWidget):
         sw2 = fm.horizontalAdvance(sub2)
         painter.drawText(int(cx - sw2 / 2), int(cy + 22), sub2)
 
+    def _reset_clock_time(self, key: str) -> str:
+        """Wall-clock reset time for the side panel: 'resets 11:43 pm' for
+        same-day 5h windows, 'resets Sun 11:43 pm' otherwise / for weekly.
+        Empty string if no live data."""
+        from datetime import datetime, timezone
+        rl = (self._official or {}).get("rate_limits") or {}
+        block = rl.get(key) or {}
+        ts = block.get("resets_at")
+        if ts is None:
+            return ""
+        try:
+            if isinstance(ts, (int, float)):
+                reset_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            else:
+                reset_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except Exception:
+            return ""
+        local = reset_dt.astimezone()
+        now_local = datetime.now().astimezone()
+        same_day = local.date() == now_local.date()
+        # %-I drops the leading zero on hour, lowercase am/pm for less noise.
+        time_part = local.strftime("%-I:%M %p").lower()
+        if key == "five_hour" and same_day:
+            return f"resets {time_part}"
+        return f"resets {local.strftime('%a')} {time_part}"
+
     def _time_until_reset(self, key: str) -> str:
         """Compute 'time until window resets' from resets_at timestamp."""
         from datetime import datetime, timezone
@@ -747,8 +964,8 @@ class MeterWidget(QWidget):
         # the same track. The gap between budget-fill and time-tick IS the
         # pace story — no separate "elapsed" row needed.
         rows = [
-            ("clock",    frac5, pace5, c5),    # 5-hour pair
-            ("calendar", fracw, pacew, cw),    # weekly pair
+            ("clock",    frac5, pace5, c5, "five_hour"),  # 5-hour pair
+            ("calendar", fracw, pacew, cw, "seven_day"),  # weekly pair
         ]
         # Re-space for two big rows instead of four small ones.
         row_top = 38
@@ -760,7 +977,10 @@ class MeterWidget(QWidget):
         value_font.setPointSize(12)
         value_font.setBold(True)
 
-        for i, (icon, fill_v, time_v, color) in enumerate(rows):
+        reset_font = QFont("Helvetica Neue")
+        reset_font.setPointSize(8)
+        reset_font.setBold(False)
+        for i, (icon, fill_v, time_v, color, rl_key) in enumerate(rows):
             y_lbl = row_top + i * row_h
             y_track = y_lbl + 22
 
@@ -835,6 +1055,15 @@ class MeterWidget(QWidget):
             fm = painter.fontMetrics()
             pw = fm.horizontalAdvance(pct_str)
             painter.drawText(int(track_right - pw), int(y_lbl - 2), pct_str)
+
+            # Wall-clock reset time, dim, on its own sub-line below the track.
+            reset_text = self._reset_clock_time(rl_key)
+            if reset_text:
+                painter.setFont(reset_font)
+                dim = QColor(color)
+                dim.setAlpha(170)
+                painter.setPen(dim)
+                painter.drawText(int(track_left), int(y_track + 16), reset_text)
 
     def _draw_pair_icon(self, painter, kind: str, x: int, y: int, color: QColor) -> None:
         """Tiny glyph in place of a row label. kind ∈ {"clock", "calendar"}."""
@@ -1097,8 +1326,9 @@ class MeterWidget(QWidget):
         # Center stack — three equal-size lines, distinguished by weight and
         # alpha rather than by font size:
         #   line 1 (top)    : NN% USED  — color + light  (the *what*)
-        #   line 2 (middle) : 4h 43m    — color + bold   (the *time*, primary)
-        #   line 3 (bottom) : ON PACE   — color + heavy  (the *verdict*, action)
+        #   line 2 (middle) : ON PACE   — color + heavy  (the *verdict*, primary)
+        #   line 3 (bottom) : 4h 43m    — color + bold   (the *time*)
+        # Wall-clock reset time lives in the side panel, not here.
         line_font = QFont("Helvetica Neue")
         line_font.setPointSize(11)
         painter.setFont(line_font)
@@ -1118,8 +1348,8 @@ class MeterWidget(QWidget):
 
         lines = (
             (pct_str,  QFont.Medium,    dim_color),
-            (win_left, QFont.Bold,      color5),
             (verdict,  QFont.Black,     bright_color),
+            (win_left, QFont.Bold,      color5),
         )
 
         block_top = cy - line_h * 1.5 + fm.ascent()
