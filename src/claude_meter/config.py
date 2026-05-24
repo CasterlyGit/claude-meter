@@ -38,6 +38,13 @@ DANGER_THRESHOLD = 0.85
 # How often the dashboard re-reads transcripts.
 REFRESH_SECONDS = 5
 
+# How often the meter fires its own refresh prompt to keep
+# ~/.claude/state/rate-limits.json from going stale when no interactive
+# Claude session is touching the statusline hook. 10 minutes = 6 prompts/hour,
+# tiny token cost. Guard inside the meter skips the call when the data is
+# already fresh (i.e. a real session is keeping it warm).
+AUTO_REFRESH_SECONDS = 600
+
 # Window sizes.
 FIVE_HOUR_WINDOW = 5.0  # hours
 WEEKLY_WINDOW = 7 * 24.0  # hours

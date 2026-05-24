@@ -4,7 +4,7 @@
 
 A tiny always-on-top dashboard that keeps your Claude Code rate-limit windows in the corner of your eye. Two concentric rings — 5-hour outside, weekly inside — synthwave palette, every visual property doing real work. No labels cluttering the widget, no estimates: it reads the same numbers Claude Code's own `/usage` panel pulls from Anthropic.
 
-**Status:** v0.2.3 — % pills now anchor to their own ring (5h below outer, weekly at inner bottom). Builds on v0.2.2's pty self-heal + expand-from-dot refresh.
+**Status:** v0.3 — wall-clock reset times on the left panel, `ON PACE` promoted to the center of the rings, collapsed view is now a fill-from-bottom progress pillar (not an Apple-style ring), and a 10-minute self-refresh keeps the numbers live without you clicking anything.
 
 ## What the rings actually say
 
@@ -18,8 +18,9 @@ Every visual property carries information:
 | **Pace tick on the track** | Where you'd be at linear pace. Arc past the tick = burning hot |
 | **Comet tail (outer ring)** | Length is proportional to your tokens-per-minute over the last 5 minutes |
 | **Dashed overflow** | Past 100%, arc continues dashed into a second lap |
-| **Center stack** | `NN% USED` / `4h 43m` / `ON PACE` — same color, three weight tiers |
+| **Center stack** | `NN% USED` / `ON PACE` / `4h 43m` — same color, three weight tiers, verdict in the middle |
 | **Pills inside each ring** | The literal % for that window, color-matched, near the bottom of the ring |
+| **Side panel (left)** | Two rails (5h, weekly) with the colored fill + a white tick for pace; under each rail the wall-clock reset time (`resets 11:43 pm`, `resets Sun 11:43 pm`) so you know *when*, not just *how long* |
 
 ## Why this exists
 
@@ -31,16 +32,18 @@ The whole reason this exists: knowing how much of your 5h window is left changes
 
 The widget pins to the top-right of your rightmost monitor — right where macOS menu-bar dropdowns and Spotlight render. So:
 
-- **Click the chevron** (top-right of the widget) → collapses to a tiny urgency-colored dot. The dot still pulses with the live 5-hour hue so it's not blind.
-- **Click the dot** → expands back.
+- **Click the chevron** (top-right of the widget) → collapses to a small **progress pillar**: a dark circle that fills bottom-up by your 5-hour percentage, framed in the urgency color. Climbs visibly as you spend, so the collapsed view is enough on its own — no need to re-expand to know where you are.
+- **Click the pillar** → expands back to the full meter.
 
-22px when collapsed. Plenty of room for menu items, Spotlight, notification flyouts.
+42px when collapsed. Plenty of room for menu items, Spotlight, notification flyouts.
 
-## Refresh button — explicit token-spending updates
+## Refresh — automatic every 10 min, or click for an instant one
 
-The numbers only update when *something* makes a Claude API call (a terminal `claude` rendering its statusline, the desktop Claude.app, or the VS Code extension). If you're working in the apps but not the terminal, the file freezes and the meter shows a `stale Nm` pill.
+The numbers only update when *something* makes a Claude API call (a terminal `claude` rendering its statusline, the desktop Claude.app, or the VS Code extension). If you're working in the apps but not the terminal, the file freezes.
 
-For those moments: **click the circular-arrow button** (left of the chevron). The meter owns a hidden, headless `claude` TUI running inside a pseudo-terminal — no visible window, no dock icon — and the click sends one tiny prompt to it. The TUI re-renders, the statusline hook writes fresh numbers, the meter picks them up within a few seconds. First click after a meter restart cold-boots the TUI (~5–8s). Every subsequent click is fast (~1–2s) because the TUI stays warm in the background.
+The meter fixes that itself: a background timer fires a refresh every `AUTO_REFRESH_SECONDS` (default 600s = 10 min), and *only* when the captured data is actually stale — if a real interactive session is keeping the statusline warm, the timer rides along for free and spends nothing. So the collapsed pillar keeps climbing whether you've expanded the widget or not.
+
+For instant updates: **click the circular-arrow button** (left of the chevron). The meter owns a hidden, headless `claude` TUI running inside a pseudo-terminal — no visible window, no dock icon — and the click sends one tiny prompt to it. The TUI re-renders, the statusline hook writes fresh numbers, the meter picks them up within a few seconds. First click after a meter restart cold-boots the TUI (~5–8s). Every subsequent click is fast (~1–2s) because the TUI stays warm in the background.
 
 Cost: roughly half a cent of Haiku tokens per click. Tiny against any 5h budget.
 
@@ -115,7 +118,8 @@ launchctl load ~/Library/LaunchAgents/com.casterly.claude-meter.plist
 
 - `ACTIVE_PLAN` — `"pro"`, `"max-5x"`, `"max-20x"`, or `"console"`
 - `WARN_THRESHOLD` / `DANGER_THRESHOLD` — fraction at which the rings shift hue tier
-- `REFRESH_SECONDS` — how often the meter re-reads transcripts (default 5s)
+- `REFRESH_SECONDS` — how often the meter re-reads the captured rate-limit file (default 5s)
+- `AUTO_REFRESH_SECONDS` — how often the meter fires its own statusline refresh when the file has gone stale (default 600s = 10 min)
 - `BURN_FULL_TAIL_TPM` in `window.py` — what tokens/min counts as a "full comet tail"
 
 ## Project layout
@@ -138,6 +142,7 @@ scripts/
 - [x] v0.1 — two-ring layout, statusline-driven data, synthwave palette
 - [x] v0.2 — refresh button, collapse-to-dot, `resets_at`-based time, per-ring % pills, weight-graded center stack
 - [x] v0.2.1 — refresh button uses a headless pty so it actually works (no popup terminal); monotonic guard prevents stale per-session writes from flicker-overwriting fresh data
+- [x] v0.3 — wall-clock reset times in the side panel; verdict promoted to the center of the rings; collapsed view is a fill-from-bottom progress pillar instead of a static colored dot; 10-min self-refresh so the numbers stay live without a click
 - [ ] Optional `ANTHROPIC_API_KEY` mode — one tiny ping/minute reads the rate-limit headers off the response. Costs roughly nothing in tokens, no terminal session needed. ([#1](https://github.com/CasterlyGit/claude-meter/issues/1))
 - [ ] Multi-monitor positioning preference (currently pins to rightmost; some setups want primary)
 - [ ] Linux support — the rings draw fine on PyQt5, but the always-on-top pin uses PyObjC which is darwin-only
