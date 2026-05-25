@@ -570,19 +570,25 @@ class MeterWidget(QWidget):
         p.drawRect(QRectF(float(inner.x()), float(inner.bottom()) - fh, float(inner.width()), fh))
         p.restore()
         rp = QPen(color); rp.setWidth(2); p.setPen(rp); p.setBrush(Qt.NoBrush); p.drawEllipse(inner)
-        # show just the 5h % in the center of the dot
+        # 5h % + time-left pill
         if f5 > 0:
             pct = f"{int(round(min(f5, 1.0) * 100))}%"
+            tl  = self._time_left("five_hour", config.FIVE_HOUR_WINDOW, self._five_hour)
             fnt = QFont("Menlo"); fnt.setPointSize(8); fnt.setBold(True)
             p.setFont(fnt); fm = p.fontMetrics()
-            tw = fm.horizontalAdvance(pct); th = fm.ascent()
-            pad = 4, 2; pw2 = tw + pad[0] * 2; ph2 = th + pad[1] * 2
+            lh = fm.ascent() + 1
+            lines = [pct, tl]
+            pw2 = max(fm.horizontalAdvance(s) for s in lines) + 8
+            ph2 = lh * 2 + 4
             cx = inner.x() + inner.width() / 2; cy = inner.y() + inner.height() / 2
             px_ = int(cx - pw2 / 2); py_ = int(cy - ph2 / 2)
             p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 215))
             p.drawRoundedRect(px_, py_, pw2, ph2, 5, 5)
+            yc = py_ + 2 + fm.ascent()
             p.setPen(self._bright(color))
-            p.drawText(int(cx - tw / 2), int(py_ + pad[1] + th - 1), pct)
+            p.drawText(int(cx - fm.horizontalAdvance(pct) / 2), int(yc), pct)
+            p.setPen(QColor(110, 220, 255, 230))
+            p.drawText(int(cx - fm.horizontalAdvance(tl) / 2), int(yc + lh), tl)
 
     def _paint_waiting(self, p):
         ox = self.SIDE_PANEL; oi = 14; od = self.SIZE - 2 * oi; ot = oi + self.RING_TOP
