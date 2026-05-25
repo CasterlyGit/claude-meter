@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+import threading
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, QRectF
@@ -45,17 +46,18 @@ def _save_ui_state(**kw) -> None:
 # ── Widget ────────────────────────────────────────────────────────────────────
 
 class MeterWidget(QWidget):
-    SIZE          = 200
-    SIDE_PANEL    = 160
+    SIZE          = 215
+    SIDE_PANEL    = 165
     WIDTH         = SIZE + SIDE_PANEL
     HEIGHT        = SIZE
     MARGIN        = 14
-    DOT_SIZE      = 42
+    DOT_W         = 120   # collapsed pill width
+    DOT_H         = 38    # collapsed pill height
     CHEV_SIZE     = 22
     CHEV_MARGIN   = 7
     RING_THICK    = 13
     RING_GAP      = 4
-    RING_TOP      = 14   # push rings down for button breathing room
+    RING_TOP      = 0    # rings centered; buttons live in side panel, not ring zone
 
     BURN_FULL_TPM  = 50_000
     MAX_TAIL_DEG   = 35.0
@@ -68,15 +70,20 @@ class MeterWidget(QWidget):
 
         st = _load_ui_state()
         self._collapsed: bool = bool(st.get("collapsed", False))
-        self.setFixedSize(self.DOT_SIZE if self._collapsed else self.WIDTH,
-                          self.DOT_SIZE if self._collapsed else self.HEIGHT)
+        self.setFixedSize(self.DOT_W if self._collapsed else self.WIDTH,
+                          self.DOT_H if self._collapsed else self.HEIGHT)
 
-        # Data state
+        # Data state (read only on main thread, written by _apply_staged)
         self._five_hour: counter.WindowStats | None = None
         self._weekly:    counter.WindowStats | None = None
         self._burn_tpm:  float = 0.0
         self._official:  dict | None = None
         self._last_good_official: dict | None = None
+
+        # Background-fetch state — written by bg thread, consumed by _tick_anim
+        self._data_lock   = threading.Lock()
+        self._staged: dict | None = None   # set by bg thread
+        self._fetch_busy  = False          # guards against overlapping fetches
 
         # Refresh-in-flight state
         self._refresh_pending:      bool = False
@@ -89,9 +96,9 @@ class MeterWidget(QWidget):
 
         self._position_initial(st)
 
-        # Data read every 5 s
+        # Schedule a background data fetch every 5 s (no I/O on main thread)
         self._data_timer = QTimer(self)
-        self._data_timer.timeout.connect(self._refresh_data)
+        self._data_timer.timeout.connect(self._schedule_fetch)
         self._data_timer.start(config.REFRESH_SECONDS * 1000)
 
         # Pin to screen every 2 s
@@ -104,7 +111,7 @@ class MeterWidget(QWidget):
         self._auto_refresh_timer.timeout.connect(self._auto_refresh_tick)
         self._auto_refresh_timer.start(config.AUTO_REFRESH_SECONDS * 1000)
 
-        # 20 fps animation tick for comet + pace pulse
+        # 20 fps animation tick — also applies staged data from bg thread
         self._anim_phase = 0.0
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._tick_anim)
@@ -115,12 +122,30 @@ class MeterWidget(QWidget):
               f"pty auto-refresh every {config.AUTO_REFRESH_SECONDS}s (unconditional)",
               file=sys.stderr, flush=True)
 
-        self._refresh_data()
+        # Kick off the first fetch immediately in the background
+        self._schedule_fetch()
 
     # ── Timers ────────────────────────────────────────────────────────────────
 
     def _tick_anim(self) -> None:
         self._anim_phase = (self._anim_phase + 0.04) % (2 * math.pi)
+        # Apply any data fetched by the background thread
+        with self._data_lock:
+            staged = self._staged
+            self._staged = None
+        if staged is not None:
+            self._five_hour = staged["five_hour"]
+            self._weekly    = staged["weekly"]
+            self._burn_tpm  = staged["burn_tpm"]
+            self._official  = staged["official"]
+            if staged["official"] is not None:
+                self._last_good_official = staged["official"]
+            if self._refresh_pending:
+                cur = (self._official or {}).get("captured_at") if self._official else None
+                if cur and cur != self._refresh_baseline_ts:
+                    self._refresh_pending = False
+                    self._refresh_baseline_ts = None
+                    self._refresh_recycled = False
         self.update()
 
     def _auto_refresh_tick(self) -> None:
@@ -135,12 +160,7 @@ class MeterWidget(QWidget):
         self._run_refresh()
 
     def _run_refresh(self) -> None:
-        from . import pty_session
         if self._refresh_pending:
-            return
-        try:
-            pty_session.refresh()
-        except Exception:
             return
         self._refresh_pending = True
         self._refresh_recycled = False
@@ -154,13 +174,26 @@ class MeterWidget(QWidget):
             QTimer.singleShot(ms, self._refresh_data)
         QTimer.singleShot(130_000, self._clear_refresh_pending)
         self.update()
+        # Run pty I/O off the Qt main thread — spawn() sleeps 6+ s which
+        # would freeze the event loop and cause a beach ball.
+        threading.Thread(target=self._pty_refresh_bg, daemon=True).start()
+
+    def _pty_refresh_bg(self) -> None:
+        try:
+            from . import pty_session
+            pty_session.refresh()
+        except Exception:
+            pass
 
     def _maybe_recycle_pty(self) -> None:
         if not self._refresh_pending or self._refresh_recycled:
             return
         self._refresh_recycled = True
-        from . import pty_session
+        threading.Thread(target=self._pty_recycle_bg, daemon=True).start()
+
+    def _pty_recycle_bg(self) -> None:
         try:
+            from . import pty_session
             pty_session.recycle()
         except Exception:
             pass
@@ -172,26 +205,35 @@ class MeterWidget(QWidget):
             self._refresh_recycled = False
             self.update()
 
-    # ── Data ─────────────────────────────────────────────────────────────────
+    # ── Data (all disk I/O runs on a daemon thread) ───────────────────────────
 
-    def _refresh_data(self) -> None:
+    def _schedule_fetch(self) -> None:
+        """Enqueue a background data fetch. No-op if one is already running."""
+        if self._fetch_busy:
+            return
+        self._fetch_busy = True
+        threading.Thread(target=self._fetch_bg, daemon=True).start()
+
+    def _fetch_bg(self) -> None:
+        """Background thread: read all data, stage it for the main thread."""
         try:
             now = counter.now_utc()
-            self._five_hour = counter.stats_for_window(now, config.FIVE_HOUR_WINDOW)
-            self._weekly    = counter.stats_for_window(now, config.WEEKLY_WINDOW)
-            self._burn_tpm  = counter.burn_rate_last_n_minutes(now, 30.0)
-            self._official  = counter.read_official_rate_limits()
-            if self._official is not None:
-                self._last_good_official = self._official
+            five_hour = counter.stats_for_window(now, config.FIVE_HOUR_WINDOW)
+            weekly    = counter.stats_for_window(now, config.WEEKLY_WINDOW)
+            burn_tpm  = counter.burn_rate_last_n_minutes(now, 30.0)
+            official  = counter.read_official_rate_limits()
+            with self._data_lock:
+                self._staged = dict(five_hour=five_hour, weekly=weekly,
+                                    burn_tpm=burn_tpm, official=official)
         except Exception:
-            return
-        if self._refresh_pending:
-            cur = (self._official or {}).get("captured_at") if self._official else None
-            if cur and cur != self._refresh_baseline_ts:
-                self._refresh_pending = False
-                self._refresh_baseline_ts = None
-                self._refresh_recycled = False
-        self.update()
+            pass
+        finally:
+            self._fetch_busy = False
+
+    # _refresh_data kept as an alias so QTimer.singleShot call sites in
+    # _run_refresh continue to work without change.
+    def _refresh_data(self) -> None:
+        self._schedule_fetch()
 
     def _official_pct(self, key: str, src: dict | None = None) -> float | None:
         data = src if src is not None else self._official
@@ -247,8 +289,8 @@ class MeterWidget(QWidget):
         if v == self._collapsed:
             return
         self._collapsed = v
-        self.setFixedSize(self.DOT_SIZE if v else self.WIDTH,
-                          self.DOT_SIZE if v else self.HEIGHT)
+        self.setFixedSize(self.DOT_W if v else self.WIDTH,
+                          self.DOT_H if v else self.HEIGHT)
         self._clamp_to_screen()
         _save_ui_state(collapsed=v)
         self.update()
@@ -548,8 +590,11 @@ class MeterWidget(QWidget):
             p.drawLine(int(tx), int(ty), int(ax), int(ay))
 
     def _paint_dot(self, p):
-        rect = self.rect(); pad = 2
-        inner = rect.adjusted(pad, pad, -pad, -pad)
+        """Collapsed pill — '72%  ·  2h30m' on a dark rounded rect."""
+        r = self.rect()
+        radius = self.DOT_H / 2
+
+        # Gather data
         f5 = 0.0; color = QColor(150, 150, 170, 220); over = 0.0
         if self._five_hour is not None and self._official:
             f5 = self._official_pct("five_hour") or 0.0
@@ -557,38 +602,47 @@ class MeterWidget(QWidget):
             delta = min(f5, 1.0) - pace
             color = self._verdict_color(delta, "5h")
             over = max(0.0, delta)
+
+        # Pulse halo behind the pill when over-pace
         if over > 0.05:
             pulse = (math.sin(self._anim_phase * (1 + over * 2)) + 1) / 2
-            halo = QColor(color); halo.setAlpha(int(40 + 70 * pulse * min(over * 4, 1.0)))
-            p.setPen(Qt.NoPen); p.setBrush(halo); p.drawEllipse(rect)
-        p.setPen(Qt.NoPen); p.setBrush(QColor(15, 17, 22, 240)); p.drawEllipse(inner)
-        # pillar fill
-        clip = QPainterPath(); clip.addEllipse(QRectF(inner))
-        p.save(); p.setClipPath(clip)
-        fh = inner.height() * max(0.0, min(f5, 1.0))
-        p.setBrush(self._bright(color))
-        p.drawRect(QRectF(float(inner.x()), float(inner.bottom()) - fh, float(inner.width()), fh))
-        p.restore()
-        rp = QPen(color); rp.setWidth(2); p.setPen(rp); p.setBrush(Qt.NoBrush); p.drawEllipse(inner)
-        # 5h % + time-left pill
-        if f5 > 0:
-            pct = f"{int(round(min(f5, 1.0) * 100))}%"
-            tl  = self._time_left("five_hour", config.FIVE_HOUR_WINDOW, self._five_hour)
-            fnt = QFont("Menlo"); fnt.setPointSize(8); fnt.setBold(True)
-            p.setFont(fnt); fm = p.fontMetrics()
-            lh = fm.ascent() + 1
-            lines = [pct, tl]
-            pw2 = max(fm.horizontalAdvance(s) for s in lines) + 8
-            ph2 = lh * 2 + 4
-            cx = inner.x() + inner.width() / 2; cy = inner.y() + inner.height() / 2
-            px_ = int(cx - pw2 / 2); py_ = int(cy - ph2 / 2)
-            p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 215))
-            p.drawRoundedRect(px_, py_, pw2, ph2, 5, 5)
-            yc = py_ + 2 + fm.ascent()
-            p.setPen(self._bright(color))
-            p.drawText(int(cx - fm.horizontalAdvance(pct) / 2), int(yc), pct)
-            p.setPen(QColor(110, 220, 255, 230))
-            p.drawText(int(cx - fm.horizontalAdvance(tl) / 2), int(yc + lh), tl)
+            halo = QColor(color); halo.setAlpha(int(35 + 65 * pulse * min(over * 4, 1.0)))
+            hp = QPen(halo); hp.setWidth(3)
+            p.setPen(hp); p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(r.adjusted(-3, -3, 3, 3), radius + 3, radius + 3)
+
+        # Pill body
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(15, 17, 22, 245))
+        p.drawRoundedRect(r, radius, radius)
+
+        # Thin fill bar at the very bottom of the pill
+        bar_pad = 6; bar_h = 3
+        bar_x = bar_pad; bar_y = r.height() - bar_pad
+        bar_w = r.width() - bar_pad * 2
+        p.setBrush(QColor(255, 255, 255, 22))
+        p.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 1, 1)
+        fill_w = int(bar_w * min(f5, 1.0))
+        if fill_w > 1:
+            p.setBrush(color)
+            p.drawRoundedRect(bar_x, bar_y, fill_w, bar_h, 1, 1)
+
+        # Label  "72%  ·  2h30m"
+        pct = f"{int(round(min(f5, 1.0) * 100))}%" if self._official else "–"
+        tl  = (self._time_left("five_hour", config.FIVE_HOUR_WINDOW, self._five_hour)
+               if f5 > 0 else "")
+        label = f"{pct}  ·  {tl}" if tl else pct
+
+        fnt = QFont("Helvetica Neue"); fnt.setPointSize(12); fnt.setBold(True)
+        p.setFont(fnt); fm = p.fontMetrics()
+        text_y = int((r.height() - bar_h - bar_pad) / 2 + fm.ascent() / 2)
+        p.setPen(self._bright(color))
+        p.drawText(int(r.width() / 2 - fm.horizontalAdvance(label) / 2), text_y, label)
+
+        # Border ring
+        bp = QPen(QColor(color.red(), color.green(), color.blue(), 120)); bp.setWidth(1)
+        p.setPen(bp); p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(r.adjusted(0, 0, -1, -1), radius, radius)
 
     def _paint_waiting(self, p):
         ox = self.SIDE_PANEL; oi = 14; od = self.SIZE - 2 * oi; ot = oi + self.RING_TOP
@@ -620,7 +674,7 @@ class MeterWidget(QWidget):
         xl, xtrack, tw = 14, 14, self.SIDE_PANEL - 28
         pulse = (math.sin(self._anim_phase) + 1) / 2
         vf = QFont("Helvetica Neue"); vf.setPointSize(12); vf.setBold(True)
-        rf = QFont("Helvetica Neue"); rf.setPointSize(8)
+        rf = QFont("Helvetica Neue"); rf.setPointSize(9)
         rows = [("clock", f5, p5, c5, "five_hour"), ("calendar", fw, pw, cw, "seven_day")]
         for i, (icon, fill, time_v, color, rl_key) in enumerate(rows):
             ytop = 38 + i * 60; ytrack = ytop + 22
@@ -657,8 +711,8 @@ class MeterWidget(QWidget):
             # reset time
             rt = self._reset_wall(rl_key)
             if rt:
-                p.setFont(rf); dc = QColor(color); dc.setAlpha(170)
-                p.setPen(dc); p.drawText(tleft, ytrack + 16, rt)
+                p.setFont(rf); dc = QColor(color); dc.setAlpha(215)
+                p.setPen(dc); p.drawText(tleft, ytrack + 17, rt)
         # ref timestamp
         cap = (self._official or {}).get("captured_at") if self._official else None
         if cap:
