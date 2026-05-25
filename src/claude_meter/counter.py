@@ -31,9 +31,12 @@ def read_official_rate_limits() -> dict | None:
     if not RATE_LIMITS_FILE.exists():
         return None
     try:
-        with RATE_LIMITS_FILE.open() as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
+        raw = RATE_LIMITS_FILE.read_text()
+        # Use raw_decode so trailing garbage (e.g. from a non-atomic write race)
+        # doesn't blow up the parse — we just take the first valid JSON object.
+        obj, _ = json.JSONDecoder().raw_decode(raw.strip())
+        return obj
+    except (OSError, json.JSONDecodeError, ValueError):
         return None
 
 
