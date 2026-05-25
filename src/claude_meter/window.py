@@ -1,23 +1,8 @@
-"""PyQt floating window pinned to a configurable corner of a chosen display.
+"""PyQt floating meter pinned to a corner of a chosen display.
 
-Default: top-left of the primary screen (the MacBook built-in display in a
-dual-monitor setup). Right-click on the meter opens a menu to pick a
-different screen or corner; the choice persists in
-``~/.claude/state/claude-meter-position.json`` so it survives restarts.
-
-
-Visual language — every property of the rings encodes information:
-  * Filled arc length = % of ceiling used
-  * Hue family       = which window (5h = cyan/coral, weekly = green/amber)
-  * Hue intensity    = urgency tier (calm → warn → danger)
-  * Pace tick        = where you "should be" right now at this point in the window
-  * Track opacity    = time pressure (track brightens as window winds down)
-  * Comet tail       = burn rate over last 5 min (length proportional to tok/min)
-  * Ring thickness   = which window has more pressure (heavier = more loaded)
-  * Dashed overflow  = arc past 100% (drawn dashed) when above ceiling estimate
-
-Pinning uses curby's NSView→NSWindow shim — battle-tested and survives
-app switches.
+Visual language:
+  arc fill = % of ceiling used · hue = pace delta · comet = burn rate
+  pace tick = where you "should be" now · collapsed dot = pillar fill by 5h %
 """
 from __future__ import annotations
 
@@ -26,8 +11,8 @@ import math
 import sys
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QTimer, QPoint
-from PyQt5.QtGui import QColor, QFont, QPainter, QPen
+from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, QRectF
+from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QPainterPath
 from PyQt5.QtWidgets import QApplication, QWidget
 
 from claude_meter import config, counter
@@ -37,265 +22,122 @@ from claude_meter.mac_window import make_always_visible
 POSITION_FILE = Path.home() / ".claude" / "state" / "claude-meter-position.json"
 
 
-def _load_state() -> dict:
-    """Return persisted UI state (position + collapsed flag). Missing/corrupt
-    files return an empty dict."""
+# ── State persistence ─────────────────────────────────────────────────────────
+
+def _load_ui_state() -> dict:
     try:
-        with POSITION_FILE.open() as fh:
-            data = json.load(fh)
+        data = json.loads(POSITION_FILE.read_text())
         return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    except Exception:
         return {}
 
 
-def _load_saved_position() -> tuple[int, int] | None:
-    data = _load_state()
-    try:
-        return int(data["x"]), int(data["y"])
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def _load_saved_collapsed() -> bool:
-    return bool(_load_state().get("collapsed", False))
-
-
-def _save_state(**updates) -> None:
-    """Merge updates into the persisted state file."""
+def _save_ui_state(**kw) -> None:
     try:
         POSITION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        data = _load_state()
-        data.update(updates)
-        with POSITION_FILE.open("w") as fh:
-            json.dump(data, fh)
+        data = _load_ui_state()
+        data.update(kw)
+        POSITION_FILE.write_text(json.dumps(data))
     except OSError:
         pass
 
 
-def _save_position(x: int, y: int) -> None:
-    _save_state(x=int(x), y=int(y))
-
-
-def _save_collapsed(collapsed: bool) -> None:
-    _save_state(collapsed=bool(collapsed))
-
+# ── Widget ────────────────────────────────────────────────────────────────────
 
 class MeterWidget(QWidget):
-    # Widget dimensions — sized for legibility on non-Retina ultrawide
-    # monitors at 100% scaling. If you want the older compact look, halve
-    # SIZE and SIDE_PANEL and shrink each font by 3pt.
-    SIZE = 200           # rings area (was 140)
-    SIDE_PANEL = 160     # extra width to the LEFT for info readouts (was 110)
-    WIDTH = SIZE + SIDE_PANEL
-    HEIGHT = SIZE
-    MARGIN_FROM_EDGE = 14
-    DOT_SIZE = 42        # bigger so the collapsed pillar-fill is legible from a glance
-    CHEV_SIZE = 22
-    CHEV_MARGIN = 7
-    BASE_RING_THICKNESS = 13   # scaled up with SIZE
-    MAX_RING_THICKNESS = 18
-    MIN_RING_THICKNESS = 8
-    RING_GAP = 4
-    # Push the ring stack down so the top-left buttons get visual breathing
-    # room and the rings sit closer to vertical center of the widget.
-    RING_TOP_OFFSET = 14
+    SIZE          = 200
+    SIDE_PANEL    = 160
+    WIDTH         = SIZE + SIDE_PANEL
+    HEIGHT        = SIZE
+    MARGIN        = 14
+    DOT_SIZE      = 42
+    CHEV_SIZE     = 22
+    CHEV_MARGIN   = 7
+    RING_THICK    = 13
+    RING_GAP      = 4
+    RING_TOP      = 14   # push rings down for button breathing room
 
-    # Burn-rate scale: 50k tokens/min = full comet tail.
-    BURN_FULL_TAIL_TPM = 50_000
-    MAX_TAIL_DEGREES = 35.0
+    BURN_FULL_TPM  = 50_000
+    MAX_TAIL_DEG   = 35.0
+    DRAG_THRESH    = 4
 
     def __init__(self) -> None:
-        super().__init__(
-            flags=Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
-        )
+        super().__init__(flags=Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        # Restore the last user-chosen collapsed/expanded state so the dot
-        # stays out of the way across restarts instead of always re-expanding.
-        self._collapsed: bool = _load_saved_collapsed()
-        if self._collapsed:
-            self.setFixedSize(self.DOT_SIZE, self.DOT_SIZE)
-        else:
-            self.setFixedSize(self.WIDTH, self.HEIGHT)
 
+        st = _load_ui_state()
+        self._collapsed: bool = bool(st.get("collapsed", False))
+        self.setFixedSize(self.DOT_SIZE if self._collapsed else self.WIDTH,
+                          self.DOT_SIZE if self._collapsed else self.HEIGHT)
+
+        # Data state
         self._five_hour: counter.WindowStats | None = None
-        self._weekly: counter.WindowStats | None = None
-        self._burn_tpm: float = 0.0  # recent burn rate (last 5 min)
-        self._official: dict | None = None
-        # Sticky copy of the last *successful* official read. Never cleared once
-        # set, so a transient read error (file lock, parse hiccup) doesn't flash
-        # the waiting-state spinner — we just keep showing the previous numbers.
+        self._weekly:    counter.WindowStats | None = None
+        self._burn_tpm:  float = 0.0
+        self._official:  dict | None = None
         self._last_good_official: dict | None = None
-        # Set true while the refresh script is in flight; cleared when the
-        # rate-limits file picks up a newer captured_at than this snapshot.
-        self._refresh_pending: bool = False
-        self._refresh_baseline_ts: str | None = None
-        # Tracks whether the in-flight refresh has already been retried via
-        # a pty recycle. Prevents an infinite respawn loop if the new TUI
-        # also fails to fire the statusline.
-        self._refresh_recycled: bool = False
 
-        # Drag state: stores the cursor-to-window offset while the user is
-        # dragging the meter to a new position. None = not currently dragging.
+        # Refresh-in-flight state
+        self._refresh_pending:      bool = False
+        self._refresh_baseline_ts:  str | None = None
+        self._refresh_recycled:     bool = False
+
+        # Drag state
         self._drag_origin: QPoint | None = None
-        self._drag_moved: bool = False
+        self._drag_moved:  bool = False
 
-        self._position_initial()
+        self._position_initial(st)
 
+        # Data read every 5 s
         self._data_timer = QTimer(self)
         self._data_timer.timeout.connect(self._refresh_data)
         self._data_timer.start(config.REFRESH_SECONDS * 1000)
 
+        # Pin to screen every 2 s
         self._pin_timer = QTimer(self)
         self._pin_timer.timeout.connect(lambda: make_always_visible(self))
         self._pin_timer.start(2000)
 
-        # Self-driven refresh so the meter stays live even when no
-        # interactive Claude session is firing the statusline hook. The
-        # tick only spends tokens if the captured data has actually gone
-        # stale — if a real session is keeping rate-limits.json warm we
-        # ride along for free. Fires regardless of collapsed/expanded, so
-        # the dot keeps climbing without the user expanding the widget.
+        # Pty refresh every AUTO_REFRESH_SECONDS — unconditional (see below)
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.timeout.connect(self._auto_refresh_tick)
         self._auto_refresh_timer.start(config.AUTO_REFRESH_SECONDS * 1000)
-        from datetime import datetime
-        print(
-            f"[{datetime.now().strftime('%H:%M:%S')}] claude-meter started; "
-            f"pty auto-refresh every {config.AUTO_REFRESH_SECONDS}s (unconditional)",
-            file=sys.stderr,
-            flush=True,
-        )
 
-        # Animation tick: drives the comet tail rotation and pace pulse
+        # 20 fps animation tick for comet + pace pulse
         self._anim_phase = 0.0
         self._anim_timer = QTimer(self)
-        self._anim_timer.timeout.connect(self._tick_animation)
-        self._anim_timer.start(50)  # 20fps — smooth motion, low CPU
+        self._anim_timer.timeout.connect(self._tick_anim)
+        self._anim_timer.start(50)
+
+        from datetime import datetime
+        print(f"[{datetime.now():%H:%M:%S}] claude-meter started; "
+              f"pty auto-refresh every {config.AUTO_REFRESH_SECONDS}s (unconditional)",
+              file=sys.stderr, flush=True)
 
         self._refresh_data()
 
-    def _tick_animation(self) -> None:
+    # ── Timers ────────────────────────────────────────────────────────────────
+
+    def _tick_anim(self) -> None:
         self._anim_phase = (self._anim_phase + 0.04) % (2 * math.pi)
         self.update()
 
-    def _current_width(self) -> int:
-        return self.DOT_SIZE if self._collapsed else self.WIDTH
-
-    def _current_height(self) -> int:
-        return self.DOT_SIZE if self._collapsed else self.HEIGHT
-
-    def _position_initial(self) -> None:
-        """First placement at launch.
-
-        Prefer a saved position if it still falls inside one of the active
-        screens (so a drag survives restart). Otherwise default to the
-        top-left of the MacBook's built-in display — even when macOS has
-        marked an external as primary. The built-in is identified by name
-        (``Color LCD``, ``Built-in``, etc.); if no such screen is found we
-        fall back to the primary screen.
-        """
-        saved = _load_saved_position()
-        if saved is not None and self._point_on_any_screen(*saved):
-            self.move(*saved)
+    def _auto_refresh_tick(self) -> None:
+        """Always fire a pty call — captured_at updates every 30 s even when
+        rate-limit VALUES haven't changed, so age-gating gives false freshness."""
+        from datetime import datetime
+        ts = datetime.now().strftime("%H:%M:%S")
+        if self._refresh_pending:
+            print(f"[{ts}] auto-refresh tick: skip (in-flight)", file=sys.stderr, flush=True)
             return
-        target = self._preferred_screen()
-        geo = target.availableGeometry()
-        x = geo.left() + self.MARGIN_FROM_EDGE
-        y = geo.top() + self.MARGIN_FROM_EDGE
-        self.move(x, y)
-
-    def _preferred_screen(self):
-        """Return the MacBook built-in screen if attached, else primary.
-
-        macOS marks whichever display the user designated as 'Main' as
-        primary, which is often the external in a docked setup. We don't
-        want that — the user wants the meter on the laptop. Match by Qt
-        screen name: built-in displays show as ``Color LCD`` (Intel /
-        older Apple Silicon) or ``Built-in Retina Display`` (newer).
-        """
-        app = QApplication.instance()
-        for screen in app.screens():
-            name = (screen.name() or "").lower()
-            if "color lcd" in name or "built-in" in name or "builtin" in name:
-                return screen
-        return app.primaryScreen()
-
-    def _point_on_any_screen(self, x: int, y: int) -> bool:
-        """True if (x, y) is inside the available geometry of some screen.
-
-        Used to drop a stale saved position if the user has unplugged the
-        monitor it lived on. Checks the *top-left* corner of where the
-        widget would sit, plus a small inset, so we don't accept positions
-        that would render entirely off-screen.
-        """
-        app = QApplication.instance()
-        for screen in app.screens():
-            geo = screen.availableGeometry()
-            if geo.contains(x + 4, y + 4):
-                return True
-        return False
-
-    def _clamp_to_visible_screen(self) -> None:
-        """If the widget has drifted off-screen, snap it back onto a screen."""
-        pos = self.pos()
-        if self._point_on_any_screen(pos.x(), pos.y()):
-            return
-        target = self._preferred_screen()
-        geo = target.availableGeometry()
-        self.move(geo.left() + self.MARGIN_FROM_EDGE, geo.top() + self.MARGIN_FROM_EDGE)
-
-    # ------------------------------------------------------------------
-    # Collapse / expand
-    # ------------------------------------------------------------------
-
-    def _set_collapsed(self, collapsed: bool) -> None:
-        """Toggle between full meter and a tiny urgency-colored dot."""
-        if collapsed == self._collapsed:
-            return
-        self._collapsed = collapsed
-        if collapsed:
-            self.setFixedSize(self.DOT_SIZE, self.DOT_SIZE)
-        else:
-            self.setFixedSize(self.WIDTH, self.HEIGHT)
-        # Stay where the user dragged us, just nudge back on-screen if the
-        # size change pushed an edge past the screen boundary.
-        self._clamp_to_visible_screen()
-        # Persist so the user's choice survives launchd restarts.
-        _save_collapsed(collapsed)
-        self.update()
-
-    def _chev_rect(self):
-        """Rect of the collapse chevron in the expanded widget (top-left corner)."""
-        from PyQt5.QtCore import QRect
-        return QRect(
-            self.CHEV_MARGIN,
-            self.CHEV_MARGIN,
-            self.CHEV_SIZE,
-            self.CHEV_SIZE,
-        )
-
-    def _refresh_rect(self):
-        """Rect of the refresh button — sits to the RIGHT of the chevron in
-        the top-left button cluster."""
-        from PyQt5.QtCore import QRect
-        return QRect(
-            self.CHEV_MARGIN * 2 + self.CHEV_SIZE,
-            self.CHEV_MARGIN,
-            self.CHEV_SIZE,
-            self.CHEV_SIZE,
-        )
+        print(f"[{ts}] auto-refresh tick: FIRING", file=sys.stderr, flush=True)
+        self._run_refresh()
 
     def _run_refresh(self) -> None:
-        """Send a tiny prompt to the persistent headless claude TUI we own.
-        The TUI re-renders, the statusline hook fires, the rate-limits file
-        updates within ~5 seconds. First click is slow (~5s cold pty boot);
-        subsequent clicks are ~1-2s because the TUI is already running."""
         from . import pty_session
         if self._refresh_pending:
-            return  # already in-flight; don't double-spend tokens
-        # send_prompt is fire-and-forget and pty_session de-dupes concurrent
-        # calls itself, so we don't need to check its return value.
+            return
         try:
             pty_session.refresh()
         except Exception:
@@ -303,31 +145,17 @@ class MeterWidget(QWidget):
         self._refresh_pending = True
         self._refresh_recycled = False
         self._refresh_baseline_ts = (self._official or {}).get("captured_at") if self._official else None
-        # Poll the file aggressively while the refresh is in flight so the
-        # spinner clears as soon as the file actually updates.
-        for delay_ms in (800, 1600, 2400, 3200, 4500, 6000, 8000, 11000, 14000):
-            QTimer.singleShot(delay_ms, self._refresh_data)
-        # If after ~7s the file still hasn't picked up a new captured_at,
-        # the TUI is alive-but-wedged: recycle it and resend the prompt.
+        for ms in (800, 1600, 2400, 3200, 4500, 6000, 8000, 11000, 14000):
+            QTimer.singleShot(ms, self._refresh_data)
         QTimer.singleShot(7_000, self._maybe_recycle_pty)
-        # Second post-recycle poll window so the spinner clears the moment
-        # the respawned TUI's first statusline tick hits the file.
-        for delay_ms in (9000, 11000, 13000, 16000, 19000, 22000):
-            QTimer.singleShot(delay_ms, self._refresh_data)
-        # Cold-spawn poll window. The very first refresh after a meter
-        # restart has to wait for the headless TUI to finish booting
-        # (auth check, trust dialog, splash) — empirically ~108s before
-        # "ok" actually lands and the statusline fires.
-        for delay_ms in (30_000, 40_000, 55_000, 70_000, 90_000, 110_000, 125_000):
-            QTimer.singleShot(delay_ms, self._refresh_data)
-        # Safety: hard-clear the pending flag after 130s even if recycle
-        # also failed (no network, auth broken, etc). Covers cold spawns.
+        for ms in (9000, 11000, 13000, 16000, 19000, 22000):
+            QTimer.singleShot(ms, self._refresh_data)
+        for ms in (30_000, 40_000, 55_000, 70_000, 90_000, 110_000, 125_000):
+            QTimer.singleShot(ms, self._refresh_data)
         QTimer.singleShot(130_000, self._clear_refresh_pending)
         self.update()
 
     def _maybe_recycle_pty(self) -> None:
-        """If the refresh is still pending after the first window, the TUI
-        is wedged. Force-respawn it once and resend."""
         if not self._refresh_pending or self._refresh_recycled:
             return
         self._refresh_recycled = True
@@ -337,20 +165,6 @@ class MeterWidget(QWidget):
         except Exception:
             pass
 
-    def _auto_refresh_tick(self) -> None:
-        """Background tick — always fires a pty refresh so we get current
-        rate-limit headers from the API. The statusline hook updates
-        captured_at every 30 s even when the rate-limit VALUES haven't
-        changed, so age-based skipping gives a false sense of freshness.
-        Only skip if a refresh is already in flight."""
-        from datetime import datetime
-        ts = datetime.now().strftime("%H:%M:%S")
-        if self._refresh_pending:
-            print(f"[{ts}] auto-refresh tick: skip (in-flight)", file=sys.stderr, flush=True)
-            return
-        print(f"[{ts}] auto-refresh tick: FIRING", file=sys.stderr, flush=True)
-        self._run_refresh()
-
     def _clear_refresh_pending(self) -> None:
         if self._refresh_pending:
             self._refresh_pending = False
@@ -358,149 +172,146 @@ class MeterWidget(QWidget):
             self._refresh_recycled = False
             self.update()
 
-    DRAG_THRESHOLD_PX = 4  # press+move under this is treated as a click, not a drag
-
-    def mousePressEvent(self, event):  # noqa: N802
-        # Right-click toggles collapse (kept for power users).
-        if event.button() == Qt.RightButton:
-            self._set_collapsed(not self._collapsed)
-            event.accept()
-            return
-        if event.button() == Qt.LeftButton:
-            # If the press lands on a known button hit-rect, remember it but
-            # don't start a drag yet — the action only fires on release if
-            # the user didn't actually drag. This way the user can grab any
-            # pixel of the widget (including the buttons) to drag it.
-            self._drag_origin = event.globalPos() - self.frameGeometry().topLeft()
-            self._drag_moved = False
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):  # noqa: N802
-        if self._drag_origin is None or not (event.buttons() & Qt.LeftButton):
-            super().mouseMoveEvent(event)
-            return
-        new_pos = event.globalPos() - self._drag_origin
-        delta = (new_pos - self.frameGeometry().topLeft()).manhattanLength()
-        if delta >= self.DRAG_THRESHOLD_PX:
-            self._drag_moved = True
-        if self._drag_moved:
-            self.move(new_pos)
-        event.accept()
-
-    def mouseReleaseEvent(self, event):  # noqa: N802
-        if event.button() != Qt.LeftButton or self._drag_origin is None:
-            super().mouseReleaseEvent(event)
-            return
-        was_dragged = self._drag_moved
-        press_pos = event.pos()
-        self._drag_origin = None
-        self._drag_moved = False
-        if was_dragged:
-            pos = self.pos()
-            _save_position(pos.x(), pos.y())
-            event.accept()
-            return
-        # Not a drag — interpret as a click on whatever the cursor is over.
-        if self._collapsed:
-            # Expand instantly. No auto-refresh kicked here — auto-tick
-            # keeps the data fresh in the background; the user wants
-            # snap UI, not a wait-for-the-spinner round trip.
-            self._set_collapsed(False)
-            event.accept()
-            return
-        if self._chev_rect().contains(press_pos):
-            self._set_collapsed(True)
-            event.accept()
-            return
-        if self._refresh_rect().contains(press_pos):
-            self._run_refresh()
-            event.accept()
-            return
-        event.accept()
-
-    def showEvent(self, event):  # noqa: N802
-        super().showEvent(event)
-        make_always_visible(self)
+    # ── Data ─────────────────────────────────────────────────────────────────
 
     def _refresh_data(self) -> None:
         try:
             now = counter.now_utc()
             self._five_hour = counter.stats_for_window(now, config.FIVE_HOUR_WINDOW)
-            self._weekly = counter.stats_for_window(now, config.WEEKLY_WINDOW)
-            self._burn_tpm = counter.burn_rate_last_n_minutes(now, 30.0)
-            self._official = counter.read_official_rate_limits()
+            self._weekly    = counter.stats_for_window(now, config.WEEKLY_WINDOW)
+            self._burn_tpm  = counter.burn_rate_last_n_minutes(now, 30.0)
+            self._official  = counter.read_official_rate_limits()
             if self._official is not None:
                 self._last_good_official = self._official
         except Exception:
             return
-        # If a refresh was in flight, clear the pending flag once we see a
-        # newer captured_at than the baseline snapshot taken at click time.
         if self._refresh_pending:
-            cur_ts = (self._official or {}).get("captured_at") if self._official else None
-            if cur_ts and cur_ts != self._refresh_baseline_ts:
+            cur = (self._official or {}).get("captured_at") if self._official else None
+            if cur and cur != self._refresh_baseline_ts:
                 self._refresh_pending = False
                 self._refresh_baseline_ts = None
                 self._refresh_recycled = False
         self.update()
 
-    def _official_pct(self, key: str, source: dict | None = None) -> float | None:
-        """Return five_hour or seven_day percentage from Claude's own data.
-
-        `source` defaults to self._official; callers can pass _last_good_official
-        to avoid flashing the waiting state on transient read errors."""
-        data = source if source is not None else self._official
+    def _official_pct(self, key: str, src: dict | None = None) -> float | None:
+        data = src if src is not None else self._official
         if not data:
             return None
-        rl = (data or {}).get("rate_limits") or {}
-        block = rl.get(key)
-        if not block:
-            return None
-        return float(block.get("used_percentage", 0.0)) / 100.0
+        block = (data.get("rate_limits") or {}).get(key)
+        return float(block["used_percentage"]) / 100.0 if block else None
 
     def _data_age_seconds(self) -> float | None:
-        """How old is the captured rate-limits data, in seconds.
-
-        Reads the `captured_at` ISO timestamp from the official block and
-        diffs against now(UTC). Returns None if no data yet."""
-        if not self._official:
-            return None
-        cap = self._official.get("captured_at")
+        cap = (self._official or {}).get("captured_at") if self._official else None
         if not cap:
             return None
         from datetime import datetime, timezone
         try:
             ts = datetime.fromisoformat(str(cap).replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - ts).total_seconds()
         except Exception:
             return None
-        return (datetime.now(timezone.utc) - ts).total_seconds()
 
-    # ---- color = pace-vs-actual delta ----
-    # The dominant fill color tells you whether you're burning faster than
-    # your budget. Two parallel palettes (5h and weekly) so the rings stay
-    # visually distinct but read the same emotional meaning.
+    # ── Positioning ───────────────────────────────────────────────────────────
+
+    def _position_initial(self, st: dict) -> None:
+        try:
+            x, y = int(st["x"]), int(st["y"])
+            if self._point_on_any_screen(x, y):
+                self.move(x, y)
+                return
+        except (KeyError, TypeError, ValueError):
+            pass
+        geo = self._preferred_screen().availableGeometry()
+        self.move(geo.left() + self.MARGIN, geo.top() + self.MARGIN)
+
+    def _preferred_screen(self):
+        for s in QApplication.instance().screens():
+            n = (s.name() or "").lower()
+            if "color lcd" in n or "built-in" in n or "builtin" in n:
+                return s
+        return QApplication.instance().primaryScreen()
+
+    def _point_on_any_screen(self, x: int, y: int) -> bool:
+        return any(s.availableGeometry().contains(x + 4, y + 4)
+                   for s in QApplication.instance().screens())
+
+    def _clamp_to_screen(self) -> None:
+        p = self.pos()
+        if not self._point_on_any_screen(p.x(), p.y()):
+            geo = self._preferred_screen().availableGeometry()
+            self.move(geo.left() + self.MARGIN, geo.top() + self.MARGIN)
+
+    # ── Collapse ──────────────────────────────────────────────────────────────
+
+    def _set_collapsed(self, v: bool) -> None:
+        if v == self._collapsed:
+            return
+        self._collapsed = v
+        self.setFixedSize(self.DOT_SIZE if v else self.WIDTH,
+                          self.DOT_SIZE if v else self.HEIGHT)
+        self._clamp_to_screen()
+        _save_ui_state(collapsed=v)
+        self.update()
+
+    def _chev_rect(self) -> QRect:
+        return QRect(self.CHEV_MARGIN, self.CHEV_MARGIN, self.CHEV_SIZE, self.CHEV_SIZE)
+
+    def _refresh_rect(self) -> QRect:
+        return QRect(self.CHEV_MARGIN * 2 + self.CHEV_SIZE, self.CHEV_MARGIN,
+                     self.CHEV_SIZE, self.CHEV_SIZE)
+
+    # ── Mouse ─────────────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.RightButton:
+            self._set_collapsed(not self._collapsed); e.accept(); return
+        if e.button() == Qt.LeftButton:
+            self._drag_origin = e.globalPos() - self.frameGeometry().topLeft()
+            self._drag_moved = False; e.accept(); return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag_origin is None or not (e.buttons() & Qt.LeftButton):
+            return super().mouseMoveEvent(e)
+        new = e.globalPos() - self._drag_origin
+        if (new - self.frameGeometry().topLeft()).manhattanLength() >= self.DRAG_THRESH:
+            self._drag_moved = True
+        if self._drag_moved:
+            self.move(new)
+        e.accept()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.LeftButton or self._drag_origin is None:
+            return super().mouseReleaseEvent(e)
+        dragged, pos = self._drag_moved, e.pos()
+        self._drag_origin = None; self._drag_moved = False
+        if dragged:
+            p = self.pos(); _save_ui_state(x=p.x(), y=p.y()); e.accept(); return
+        if self._collapsed:
+            self._set_collapsed(False); e.accept(); return
+        if self._chev_rect().contains(pos):
+            self._set_collapsed(True); e.accept(); return
+        if self._refresh_rect().contains(pos):
+            self._run_refresh(); e.accept(); return
+        e.accept()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        make_always_visible(self)
+
+    # ── Color / pace ──────────────────────────────────────────────────────────
 
     def _verdict_color(self, delta: float, palette: str = "5h") -> QColor:
-        """delta = actual - expected (fraction units).
-
-        Ocean Drive / synthwave neon palette: electric cyan → seafoam → lime →
-        sunset gold → hot magenta. The 5h ring leans cooler (cyan side), the
-        weekly ring leans warmer (sunset side), but both share the same vibe.
-        """
-        # Synthwave/Ocean Drive but easier on the eye in the over-cap range,
-        # since that's where the user spends most of their time. We replace
-        # the hot pink/magenta with deep violet → indigo. Still neon, still
-        # signals 'past the line', but doesn't scream.
+        """delta = actual − expected (fraction). Positive = over pace."""
         if palette == "5h":
             stops = [
-                (-0.30, QColor(  0, 240, 255)),  # electric cyan (way under)
-                (-0.15, QColor( 70, 240, 220)),  # neon seafoam
-                (-0.05, QColor(120, 245, 180)),  # neon lime
-                ( 0.05, QColor(190, 250, 130)),  # acid lime
-                ( 0.12, QColor(180, 200, 255)),  # neon periwinkle (on-pace+)
-                ( 0.25, QColor(155, 130, 255)),  # electric violet (a bit over)
-                ( 1.00, QColor(110,  90, 230)),  # deep indigo (way over)
+                (-0.30, QColor(  0, 240, 255)),
+                (-0.15, QColor( 70, 240, 220)),
+                (-0.05, QColor(120, 245, 180)),
+                ( 0.05, QColor(190, 250, 130)),
+                ( 0.12, QColor(180, 200, 255)),
+                ( 0.25, QColor(155, 130, 255)),
+                ( 1.00, QColor(110,  90, 230)),
             ]
         else:
             stops = [
@@ -516,970 +327,387 @@ class MeterWidget(QWidget):
             if delta <= t:
                 if i == 0:
                     return c
-                t_prev, c_prev = stops[i - 1]
-                span = max(t - t_prev, 1e-6)
-                k = max(0.0, min(1.0, (delta - t_prev) / span))
-                return QColor(
-                    int(c_prev.red()   * (1 - k) + c.red()   * k),
-                    int(c_prev.green() * (1 - k) + c.green() * k),
-                    int(c_prev.blue()  * (1 - k) + c.blue()  * k),
-                )
+                t0, c0 = stops[i - 1]
+                k = max(0.0, min(1.0, (delta - t0) / max(t - t0, 1e-6)))
+                return QColor(int(c0.red()   + k * (c.red()   - c0.red())),
+                              int(c0.green() + k * (c.green() - c0.green())),
+                              int(c0.blue()  + k * (c.blue()  - c0.blue())))
         return stops[-1][1]
 
-    # ---- pace calculation ----
-
     def _pace_position(self, window_hours: float) -> float:
-        """How far through the window we are (0..1).
-
-        Uses Anthropic's authoritative `resets_at` when present — the window
-        is fixed-slot, not rolling-from-first-use. Falls back to transcript
-        heuristic only when no live data is available.
-        """
-        if window_hours <= 0:
-            return 0.0
-
-        # Prefer the official reset timestamp.
         key = "five_hour" if window_hours <= 6 else "seven_day"
-        rl = (self._official or {}).get("rate_limits") or {}
-        block = rl.get(key) or {}
+        block = ((self._official or {}).get("rate_limits") or {}).get(key) or {}
         ts = block.get("resets_at")
         if ts is not None:
             try:
                 from datetime import datetime, timezone
-                if isinstance(ts, (int, float)):
-                    reset_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                else:
-                    reset_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-                secs_left = max(0, (reset_dt - datetime.now(timezone.utc)).total_seconds())
-                total_secs = window_hours * 3600.0
-                elapsed_secs = max(0.0, total_secs - secs_left)
-                return max(0.0, min(elapsed_secs / total_secs, 1.0))
+                reset = (datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float))
+                         else datetime.fromisoformat(str(ts).replace("Z", "+00:00")))
+                left = max(0, (reset - datetime.now(timezone.utc)).total_seconds())
+                return max(0.0, min(1.0 - left / (window_hours * 3600), 1.0))
             except Exception:
                 pass
-
-        # Fallback: transcript-based heuristic.
         stats = self._five_hour if window_hours <= 6 else self._weekly
         if stats is None or stats.earliest is None:
             return 0.0
-        elapsed_min = (counter.now_utc() - stats.earliest).total_seconds() / 60.0
-        total_min = window_hours * 60.0
-        return max(0.0, min(elapsed_min / total_min, 1.0))
+        return max(0.0, min(
+            (counter.now_utc() - stats.earliest).total_seconds() / (window_hours * 3600), 1.0))
 
-    def _pace_delta(self, frac: float, pace: float) -> float:
-        """How far ahead/behind the 'fair pace' line you are.
+    def _bright(self, c: QColor) -> QColor:
+        return QColor(min(c.red() + 30, 255), min(c.green() + 30, 255), min(c.blue() + 30, 255))
 
-        > 0 → you've burned more than the time-elapsed share (warm/slow down)
-        < 0 → you've burned less than the time-elapsed share (cool/headroom)
-        """
-        return frac - pace
+    def _verdict_word(self, delta: float) -> str:
+        if delta >= 0.25: return "STOP"
+        if delta >= 0.12: return "SLOW"
+        if delta >= 0.05: return "EASE"
+        if delta >= -0.05: return "ON PACE"
+        if delta >= -0.15: return "FINE"
+        return "REST EASY"
 
-    # ---- time pressure (drives track opacity) ----
-
-    def _time_pressure(self, window_hours: float) -> float:
-        """0 = window is fresh (low pressure), 1 = window is winding down.
-
-        Approximated by: fraction of the window already 'consumed' by time,
-        since the earliest sample.
-        """
-        return self._pace_position(window_hours)
-
-    # ---- ring thickness from relative pressure ----
-
-    def _ring_thicknesses(self, frac5: float, fracw: float) -> tuple[int, int]:
-        """Both rings use base thickness — keeps the visual consistent."""
-        return self.BASE_RING_THICKNESS, self.BASE_RING_THICKNESS
-
-    # ---- painting ----
-
-    def paintEvent(self, event):  # noqa: N802
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        if self._collapsed:
-            self._paint_collapsed_dot(painter)
-            return
-
-        rect = self.rect()
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(15, 17, 22, 235))
-        painter.drawRoundedRect(rect, 18, 18)
-
-        # The rings are drawn anchored to the right of the card; the left
-        # SIDE_PANEL pixels are reserved for the info panel. Shift all ring
-        # geometry by +SIDE_PANEL so the rings sit on the right.
-        self._ring_origin_x = self.SIDE_PANEL
-
-        if self._five_hour is None or self._weekly is None:
-            return
-
-        # Use the sticky last-good snapshot so a transient file-read failure
-        # (lock, parse error) doesn't flash the animated waiting-state arcs.
-        render_official = self._last_good_official or self._official
-        official5 = self._official_pct("five_hour", render_official)
-        officialw = self._official_pct("seven_day", render_official)
-        if official5 is None or officialw is None:
-            self._draw_waiting_state(painter)
-            return
-
-        raw5 = official5
-        raww = officialw
-        frac5 = min(raw5, 1.0)
-        fracw = min(raww, 1.0)
-
-        # Feature 6: asymmetric thickness
-        t5, tw = self._ring_thicknesses(frac5, fracw)
-
-        outer_inset = 20  # scaled with SIZE
-        outer_diam = self.SIZE - 2 * outer_inset
-        outer_top = outer_inset + self.RING_TOP_OFFSET
-        outer_rect = (self._ring_origin_x + outer_inset, outer_top, outer_diam, outer_diam)
-
-        # Inner inset depends on outer thickness
-        inner_inset = outer_inset + t5 + self.RING_GAP
-        inner_diam = self.SIZE - 2 * inner_inset
-        inner_top = inner_inset + self.RING_TOP_OFFSET
-        inner_rect = (self._ring_origin_x + inner_inset, inner_top, inner_diam, inner_diam)
-
-        pace5 = self._pace_position(config.FIVE_HOUR_WINDOW)
-        pacew = self._pace_position(config.WEEKLY_WINDOW)
-        delta5 = self._pace_delta(frac5, pace5)
-        deltaw = self._pace_delta(fracw, pacew)
-
-        color5_q = self._verdict_color(delta5, "5h")
-        colorw_q = self._verdict_color(deltaw, "weekly")
-
-        self._draw_loaded_ring(
-            painter, outer_rect, t5,
-            frac=frac5, raw_frac=raw5,
-            color=color5_q,
-            pace=pace5,
-            time_pressure=self._time_pressure(config.FIVE_HOUR_WINDOW),
-            burn_tpm=self._burn_tpm,
-        )
-        self._draw_loaded_ring(
-            painter, inner_rect, tw,
-            frac=fracw, raw_frac=raww,
-            color=colorw_q,
-            pace=pacew,
-            time_pressure=self._time_pressure(config.WEEKLY_WINDOW),
-            burn_tpm=0.0,
-        )
-
-        # Draw the pace markers ON TOP of the fill arcs.
-        pulse5 = max(0.0, min(delta5 * 2.0, 1.0))
-        pulsew = max(0.0, min(deltaw * 2.0, 1.0))
-        self._draw_pace_marker(painter, outer_rect, t5, pace5, pulse5)
-        self._draw_pace_marker(painter, inner_rect, tw, pacew, pulsew)
-
-        # Percent badges on each ring (color-matched, near leading edge).
-        self._draw_ring_pct(painter, outer_rect, frac5, color5_q, label="5h")
-        self._draw_ring_pct(painter, inner_rect, fracw, colorw_q, label="wk")
-
-        self._draw_center_text(painter, frac5, fracw, delta5, deltaw)
-        self._draw_side_panel(painter, frac5, fracw, delta5, deltaw)
-        self._draw_collapse_chevron(painter)
-        self._draw_refresh_button(painter)
-
-    def _draw_ring_pct(self, painter, rect_tuple, frac, color, label):
-        """Small color-matched percentage label sitting just inside the leading
-        edge of the arc. Compact (e.g. '38%') with a tiny scope label
-        ('5h' or 'wk') stacked underneath at half size.
-
-        Placement: at the top of the ring (12 o'clock) for the outer ring and
-        at the bottom (6 o'clock) for the inner ring — keeps them from
-        colliding with the center text and with each other.
-        """
-        x, y, w, h = rect_tuple
-        cx = x + w / 2.0
-        cy = y + h / 2.0
-
-        # Each pill is vertically CENTERED on its ring's 6 o'clock — the
-        # bottom-most point of the ring's bounding circle. The pill
-        # straddles the arc (half above, half below) so it reads as part
-        # of the ring itself. Vertical separation between the two pills
-        # is intrinsic: outer 6 o'clock and inner 6 o'clock differ by
-        # exactly outer-ring-thickness + ring-gap, no manual offsets.
-        tx = cx
-        ty = y + h  # 6 o'clock of THIS ring's bounding circle
-
-        pct_text = f"{int(round(frac * 100))}%"
-
-        big_font = QFont("Helvetica Neue")
-        big_font.setPointSize(11)
-        big_font.setBold(True)
-        painter.setFont(big_font)
-        fm = painter.fontMetrics()
-        pw = fm.horizontalAdvance(pct_text)
-        ph = fm.ascent()
-
-        # Pill background for legibility against fill
-        pad_x, pad_y = 6, 3
-        pill_w = pw + pad_x * 2
-        pill_h = ph + pad_y * 2
-        px = int(tx - pill_w / 2)
-        py = int(ty - pill_h / 2)  # center the pill on the 6 o'clock point
-
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(15, 17, 22, 220))
-        painter.drawRoundedRect(px, py, pill_w, pill_h, 6, 6)
-
-        # Color-matched percent text
-        painter.setPen(color)
-        painter.drawText(int(tx - pw / 2),
-                         int(py + pad_y + ph - 1),
-                         pct_text)
-
-    def _draw_collapse_chevron(self, painter):
-        """Small clickable chevron in the top-right of the expanded widget.
-        Click it to collapse to the dot."""
-        rect = self._chev_rect()
-        # Subtle background circle for the hit target
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 26))
-        painter.drawEllipse(rect)
-
-        # Draw a "v" pointing down — visual metaphor: "collapse downward
-        # to the puck." Reads naturally as "minimize / fold away."
-        chev_pen = QPen(QColor(230, 230, 240, 220))
-        chev_pen.setWidth(2)
-        chev_pen.setCapStyle(Qt.RoundCap)
-        chev_pen.setJoinStyle(Qt.RoundJoin)
-        painter.setPen(chev_pen)
-        cx = rect.x() + rect.width() / 2
-        cy = rect.y() + rect.height() / 2
-        s = 4.0  # arm length
-        # "v" shape — two diagonals meeting at the bottom center
-        painter.drawLine(int(cx - s), int(cy - s + 1),
-                         int(cx), int(cy + s - 1))
-        painter.drawLine(int(cx), int(cy + s - 1),
-                         int(cx + s), int(cy - s + 1))
-
-    def _draw_refresh_button(self, painter):
-        """Circular-arrow refresh icon in the top-left button cluster.
-        Rendered identically whether or not a refresh is in flight — the user
-        explicitly does not want a visible spinner. All slow work happens in
-        a background thread; the icon stays a calm, static affordance."""
-        import math as _m
-        rect = self._refresh_rect()
-
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 36))
-        painter.drawEllipse(rect)
-
-        cx = rect.x() + rect.width() / 2
-        cy = rect.y() + rect.height() / 2
-        r = (rect.width() / 2) - 5
-
-        stroke_alpha = 230
-        spin = 0.0
-        pen = QPen(QColor(230, 230, 240, stroke_alpha))
-        pen.setWidth(2)
-        pen.setCapStyle(Qt.RoundCap)
-        painter.setPen(pen)
-        painter.setBrush(Qt.NoBrush)
-        start_deg = int((90 + (180 / _m.pi) * spin) * 16)
-        span_deg = -int(300 * 16)
-        painter.drawArc(int(cx - r), int(cy - r), int(r * 2), int(r * 2),
-                        start_deg, span_deg)
-
-        end_rad = _m.radians(90 + (180 / _m.pi) * spin - 300)
-        tip_x = cx + r * _m.cos(end_rad)
-        tip_y = cy - r * _m.sin(end_rad)
-        head_a = end_rad + _m.pi / 2 + 0.5
-        head_b = end_rad + _m.pi / 2 - 0.5
-        ah1_x = tip_x + 4 * _m.cos(head_a)
-        ah1_y = tip_y - 4 * _m.sin(head_a)
-        ah2_x = tip_x + 4 * _m.cos(head_b)
-        ah2_y = tip_y - 4 * _m.sin(head_b)
-        painter.drawLine(int(tip_x), int(tip_y), int(ah1_x), int(ah1_y))
-        painter.drawLine(int(tip_x), int(tip_y), int(ah2_x), int(ah2_y))
-
-    def _paint_collapsed_dot(self, painter):
-        """Collapsed view = a circular progress pillar.
-
-        Fills from the bottom up by the 5h % used (the metric that matters
-        minute-to-minute). Color = urgency. Deliberately *not* an Apple-style
-        edge ring — at this size a fill-from-bottom reads as 'how much you've
-        used' from across the room, the way a battery indicator does.
-        """
-        from PyQt5.QtCore import QRectF
-        from PyQt5.QtGui import QPainterPath
-
-        rect = self.rect()
-        pad = 2
-        inner = rect.adjusted(pad, pad, -pad, -pad)
-
-        if self._five_hour is not None and self._official:
-            frac5 = self._official_pct("five_hour") or 0.0
-            pace5 = self._pace_position(config.FIVE_HOUR_WINDOW)
-            delta5 = self._pace_delta(min(frac5, 1.0), pace5)
-            color = self._verdict_color(delta5, "5h")
-            over_pace = max(0.0, delta5)
-        else:
-            frac5 = 0.0
-            color = QColor(150, 150, 170, 220)
-            over_pace = 0.0
-
-        # Subtle halo only when meaningfully over-pace. Keeps the collapsed
-        # state quiet during normal use; only attention-grabs when needed.
-        if over_pace > 0.05:
-            pulse = (math.sin(self._anim_phase * (1 + over_pace * 2)) + 1) / 2
-            halo = QColor(color)
-            halo.setAlpha(int(40 + 70 * pulse * min(over_pace * 4, 1.0)))
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(halo)
-            painter.drawEllipse(rect)
-
-        # Dark backing circle — gives the fill a "container" to climb into
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(15, 17, 22, 240))
-        painter.drawEllipse(inner)
-
-        # Fill from the bottom, clipped to the circle. This is the "pillar".
-        clip = QPainterPath()
-        clip.addEllipse(QRectF(inner))
-        painter.save()
-        painter.setClipPath(clip)
-
-        fill_v = max(0.0, min(frac5, 1.0))
-        fill_h = inner.height() * fill_v
-        fill_rect = QRectF(
-            float(inner.x()),
-            float(inner.bottom()) - fill_h,
-            float(inner.width()),
-            fill_h,
-        )
-        bright = QColor(min(color.red() + 30, 255),
-                        min(color.green() + 30, 255),
-                        min(color.blue() + 30, 255), 245)
-        painter.setBrush(bright)
-        painter.drawRect(fill_rect)
-        painter.restore()
-
-        # Crisp outer ring in the urgency color — frames the pillar without
-        # turning into an Apple-ring progress arc (it's a static frame).
-        ring_pen = QPen(color)
-        ring_pen.setWidth(2)
-        painter.setPen(ring_pen)
-        painter.setBrush(Qt.NoBrush)
-        painter.drawEllipse(inner)
-
-        # Two-line timestamp drawn INSIDE the dot so the user can read both
-        # "when did this data last refresh" and "when does the 5h window
-        # reset" without expanding the meter. Top line = last refresh time
-        # (white), bottom line = 5h reset time (cyan, slightly dimmer so it
-        # reads as secondary info). Both small monospace on a dark pill so
-        # they stay legible regardless of the urgency fill underneath.
-        from datetime import datetime, timezone
-        ref_str = None
-        cap = (self._official or {}).get("captured_at") if self._official else None
-        if cap:
+    def _time_left(self, key: str, window_hours: float, stats) -> str:
+        block = ((self._official or {}).get("rate_limits") or {}).get(key) or {}
+        ts = block.get("resets_at")
+        if ts is not None:
             try:
-                ts = datetime.fromisoformat(str(cap).replace("Z", "+00:00"))
-                ref_str = ts.astimezone().strftime("%H:%M")
+                from datetime import datetime, timezone
+                reset = (datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float))
+                         else datetime.fromisoformat(str(ts).replace("Z", "+00:00")))
+                s = max(0, int((reset - datetime.now(timezone.utc)).total_seconds()))
+                if s < 60:   return f"{s}s"
+                if s < 3600: return f"{s // 60}m"
+                h, m = s // 3600, (s % 3600) // 60
+                return f"{h}h {m}m" if m else f"{h}h"
             except Exception:
-                ref_str = None
-        # Bottom line: time remaining until the 5h window resets — more
-        # obvious than a wall-clock time ("2h7m" vs "21:20").
-        reset_str = None
-        dot_official = self._last_good_official or self._official
-        if dot_official:
-            rl = (dot_official or {}).get("rate_limits") or {}
-            block = rl.get("five_hour") or {}
-            rts = block.get("resets_at")
-            if rts is not None:
-                try:
-                    if isinstance(rts, (int, float)):
-                        reset_dt = datetime.fromtimestamp(rts, tz=timezone.utc)
-                    else:
-                        reset_dt = datetime.fromisoformat(str(rts).replace("Z", "+00:00"))
-                    secs_left = max(0, int((reset_dt - datetime.now(timezone.utc)).total_seconds()))
-                    if secs_left < 60:
-                        reset_str = f"{secs_left}s"
-                    elif secs_left < 3600:
-                        reset_str = f"{secs_left // 60}m"
-                    else:
-                        h = secs_left // 3600
-                        m = (secs_left % 3600) // 60
-                        reset_str = f"{h}h{m}m" if m else f"{h}h"
-                except Exception:
-                    reset_str = None
+                pass
+        if stats is None or stats.earliest is None:
+            return f"{int(window_hours)}h"
+        left = max(0, window_hours * 60 - (counter.now_utc() - stats.earliest).total_seconds() / 60)
+        h, m = int(left // 60), int(round(left % 60))
+        return f"{h}h {m}m" if (h and m) else (f"{h}h" if h else f"{m}m")
 
-        if ref_str or reset_str:
-            font = QFont("Menlo")
-            font.setPointSize(8)
-            font.setBold(True)
-            painter.setFont(font)
-            fm = painter.fontMetrics()
-            line_h = fm.ascent() + 1
-            widths = [fm.horizontalAdvance(s) for s in (ref_str, reset_str) if s]
-            text_w = max(widths)
-            n_lines = sum(1 for s in (ref_str, reset_str) if s)
-            pad_x, pad_y = 4, 2
-            pill_w = text_w + pad_x * 2
-            pill_h = line_h * n_lines + pad_y * 2
-            cx_dot = inner.x() + inner.width() / 2
-            cy_dot = inner.y() + inner.height() / 2
-            px = int(cx_dot - pill_w / 2)
-            py = int(cy_dot - pill_h / 2)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(0, 0, 0, 215))
-            painter.drawRoundedRect(px, py, pill_w, pill_h, 5, 5)
-            y_cursor = py + pad_y + fm.ascent()
-            if ref_str:
-                painter.setPen(QColor(235, 240, 255, 245))  # white-ish — primary
-                rw = fm.horizontalAdvance(ref_str)
-                painter.drawText(int(cx_dot - rw / 2), int(y_cursor), ref_str)
-                y_cursor += line_h
-            if reset_str:
-                painter.setPen(QColor(110, 220, 255, 230))  # neon cyan — secondary
-                rw = fm.horizontalAdvance(reset_str)
-                painter.drawText(int(cx_dot - rw / 2), int(y_cursor), reset_str)
-
-    def _draw_waiting_state(self, painter):
-        """Render when no live rate-limit data is available.
-
-        Draws empty ring outlines and a small 'waiting' message in the center.
-        No estimates, no guessed numbers — the user asked for real data only.
-        """
-        cx = self.SIDE_PANEL + self.SIZE / 2
-        cy = self.SIZE / 2 + self.RING_TOP_OFFSET
-
-        outer_inset = 14
-        outer_diam = self.SIZE - 2 * outer_inset
-        outer_top = outer_inset + self.RING_TOP_OFFSET
-        inner_inset = outer_inset + self.BASE_RING_THICKNESS + self.RING_GAP
-        inner_diam = self.SIZE - 2 * inner_inset
-        inner_top = inner_inset + self.RING_TOP_OFFSET
-
-        # Two faint ring outlines + a slow synthwave-cyan sweep so the
-        # waiting state feels alive, not broken
-        ox = self.SIDE_PANEL
-        for idx, (rect_tuple, thickness) in enumerate([
-            ((ox + outer_inset, outer_top, outer_diam, outer_diam), self.BASE_RING_THICKNESS),
-            ((ox + inner_inset, inner_top, inner_diam, inner_diam), self.BASE_RING_THICKNESS),
-        ]):
-            x, y, w, h = rect_tuple
-            pen = QPen(QColor(255, 255, 255, 20))
-            pen.setWidth(thickness)
-            pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(pen)
-            painter.drawArc(x, y, w, h, 0, 360 * 16)
-
-            # Slow rotating arc — different speeds per ring
-            sweep_pen = QPen(QColor(110, 220, 255, 110))
-            sweep_pen.setWidth(thickness)
-            sweep_pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(sweep_pen)
-            phase = self._anim_phase * (1.0 if idx == 0 else 0.7)
-            start_angle = int(((phase / (2 * math.pi)) * 360 + idx * 180) * 16) % (360 * 16)
-            painter.drawArc(x, y, w, h, start_angle, int(-40 * 16))
-
-        # Center message
-        font = QFont("Helvetica Neue")
-        font.setPointSize(9)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.setPen(QColor(255, 255, 255, 130))
-        msg = "—"
-        fm = painter.fontMetrics()
-        mw = fm.horizontalAdvance(msg)
-        painter.drawText(int(cx - mw / 2), int(cy - 4), msg)
-
-        sub_font = QFont("Helvetica Neue")
-        sub_font.setPointSize(7)
-        painter.setFont(sub_font)
-        painter.setPen(QColor(255, 255, 255, 90))
-        sub = "no live data"
-        fm = painter.fontMetrics()
-        sw = fm.horizontalAdvance(sub)
-        painter.drawText(int(cx - sw / 2), int(cy + 10), sub)
-
-        sub2 = "open a claude session"
-        sw2 = fm.horizontalAdvance(sub2)
-        painter.drawText(int(cx - sw2 / 2), int(cy + 22), sub2)
-
-    def _reset_clock_time(self, key: str) -> str:
-        """Wall-clock reset time for the side panel: 'resets 11:43 pm' for
-        same-day 5h windows, 'resets Sun 11:43 pm' otherwise / for weekly.
-        Empty string if no live data."""
-        from datetime import datetime, timezone
-        rl = (self._official or {}).get("rate_limits") or {}
-        block = rl.get(key) or {}
+    def _reset_wall(self, key: str) -> str:
+        block = ((self._official or {}).get("rate_limits") or {}).get(key) or {}
         ts = block.get("resets_at")
         if ts is None:
             return ""
         try:
-            if isinstance(ts, (int, float)):
-                reset_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            else:
-                reset_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            from datetime import datetime, timezone
+            reset = (datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float))
+                     else datetime.fromisoformat(str(ts).replace("Z", "+00:00")))
+            local = reset.astimezone()
+            now_l = datetime.now().astimezone()
+            t = local.strftime("%-I:%M %p").lower()
+            if key == "five_hour" and local.date() == now_l.date():
+                return f"resets {t}"
+            return f"resets {local.strftime('%a')} {t}"
         except Exception:
             return ""
-        local = reset_dt.astimezone()
-        now_local = datetime.now().astimezone()
-        same_day = local.date() == now_local.date()
-        # %-I drops the leading zero on hour, lowercase am/pm for less noise.
-        time_part = local.strftime("%-I:%M %p").lower()
-        if key == "five_hour" and same_day:
-            return f"resets {time_part}"
-        return f"resets {local.strftime('%a')} {time_part}"
 
-    def _draw_side_panel(self, painter, frac5, fracw, delta5, deltaw):
-        """Left-side info panel: slider-style horizontal lines, one per dim.
+    # ── Paint ─────────────────────────────────────────────────────────────────
 
-        Four rows: 5h used, time elapsed in 5h, week used, time elapsed in week.
-        Each row: small label, a faint track line, a colored glowing knob at
-        the position. Matches the slider aesthetic from the docs demo.
-        """
-        c5 = self._verdict_color(delta5, "5h")
-        cw = self._verdict_color(deltaw, "weekly")
-        pace5 = self._pace_position(config.FIVE_HOUR_WINDOW)
-        pacew = self._pace_position(config.WEEKLY_WINDOW)
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self._collapsed:
+            self._paint_dot(p); return
 
-        # Geometry — scaled up for legibility on non-Retina ultrawide.
-        x_lbl = 14
-        x_track = 14
-        track_w = self.SIDE_PANEL - 28
-        row_top = 26
-        row_h = 38
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(15, 17, 22, 235))
+        p.drawRoundedRect(self.rect(), 18, 18)
 
-        label_font = QFont("Helvetica Neue")
-        label_font.setPointSize(10)
-        label_font.setBold(True)
-
-        # Two dual-track rows: ●━━━━━━━━━━━━━━━  with a thin time-tick on
-        # the same track. The gap between budget-fill and time-tick IS the
-        # pace story — no separate "elapsed" row needed.
-        rows = [
-            ("clock",    frac5, pace5, c5, "five_hour"),  # 5-hour pair
-            ("calendar", fracw, pacew, cw, "seven_day"),  # weekly pair
-        ]
-        # Re-space for two big rows instead of four small ones.
-        row_top = 38
-        row_h = 60
-
-        pulse = (math.sin(self._anim_phase) + 1) / 2
-
-        value_font = QFont("Helvetica Neue")
-        value_font.setPointSize(12)
-        value_font.setBold(True)
-
-        reset_font = QFont("Helvetica Neue")
-        reset_font.setPointSize(8)
-        reset_font.setBold(False)
-        for i, (icon, fill_v, time_v, color, rl_key) in enumerate(rows):
-            y_lbl = row_top + i * row_h
-            y_track = y_lbl + 22
-
-            # Icon + short scope label (kept small but explicit — "5h" / "wk")
-            self._draw_pair_icon(painter, icon, x_lbl, y_lbl - 4, color)
-            scope_font = QFont("Helvetica Neue")
-            scope_font.setPointSize(9)
-            scope_font.setBold(True)
-            painter.setFont(scope_font)
-            painter.setPen(QColor(255, 255, 255, 220))
-            scope_text = "5h" if icon == "clock" else "wk"
-            painter.drawText(x_lbl + 20, y_lbl + 8, scope_text)
-
-            # Track (rail) — pushed further right to accommodate the scope word
-            rail_offset = 46
-            track_pen = QPen(QColor(255, 255, 255, 55))
-            track_pen.setWidth(4)
-            track_pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(track_pen)
-            painter.drawLine(x_track + rail_offset, y_track,
-                             x_track + rail_offset + track_w - rail_offset, y_track)
-
-            track_left  = x_track + rail_offset
-            track_right = track_left + (track_w - rail_offset)
-            track_span  = track_right - track_left
-
-            fill_x = int(track_left + min(fill_v, 1.0) * track_span)
-            time_x = int(track_left + min(time_v, 1.0) * track_span)
-
-            # Colored fill (budget consumed)
-            fill_pen = QPen(color)
-            fill_pen.setWidth(6)
-            fill_pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(fill_pen)
-            painter.drawLine(track_left, y_track, fill_x, y_track)
-
-            # Bright knob at the fill head, with breathing halo
-            halo_r = int(11 + pulse * 3)
-            halo_color = QColor(color)
-            halo_color.setAlpha(int(60 + pulse * 90))
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(halo_color)
-            painter.drawEllipse(fill_x - halo_r, y_track - halo_r, halo_r * 2, halo_r * 2)
-            bright = QColor(color)
-            bright.setRgb(min(color.red() + 30, 255),
-                          min(color.green() + 30, 255),
-                          min(color.blue() + 30, 255))
-            painter.setBrush(bright)
-            painter.drawEllipse(fill_x - 6, y_track - 6, 12, 12)
-
-            # Time tick — small white vertical mark on the same rail.
-            # Outline (black) then white center for legibility on both
-            # filled and unfilled portions.
-            tick_h = 14
-            tick_pen_bg = QPen(QColor(0, 0, 0, 200))
-            tick_pen_bg.setWidth(5)
-            tick_pen_bg.setCapStyle(Qt.RoundCap)
-            painter.setPen(tick_pen_bg)
-            painter.drawLine(time_x, y_track - tick_h // 2,
-                             time_x, y_track + tick_h // 2)
-            tick_pen = QPen(QColor(255, 255, 255, 235))
-            tick_pen.setWidth(2)
-            tick_pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(tick_pen)
-            painter.drawLine(time_x, y_track - tick_h // 2,
-                             time_x, y_track + tick_h // 2)
-
-            # Value: just the % of budget, color-matched, right of the track
-            painter.setFont(value_font)
-            painter.setPen(bright)
-            pct_str = f"{int(round(min(fill_v, 1.0) * 100))}%"
-            fm = painter.fontMetrics()
-            pw = fm.horizontalAdvance(pct_str)
-            painter.drawText(int(track_right - pw), int(y_lbl - 2), pct_str)
-
-            # Wall-clock reset time, dim, on its own sub-line below the track.
-            reset_text = self._reset_clock_time(rl_key)
-            if reset_text:
-                painter.setFont(reset_font)
-                dim = QColor(color)
-                dim.setAlpha(170)
-                painter.setPen(dim)
-                painter.drawText(int(track_left), int(y_track + 16), reset_text)
-
-        # Bottom-of-panel "refreshed at" tick. Always shown when we have
-        # data, so a successful auto-refresh leaves a visible footprint
-        # (rings often don't change perceptibly when usage is low). The
-        # captured_at value is local-time HH:MM:SS — easy to eyeball
-        # against the wall clock to verify the auto-refresh fired.
-        cap = (self._official or {}).get("captured_at") if self._official else None
-        if cap:
-            from datetime import datetime, timezone
-            try:
-                ts = datetime.fromisoformat(str(cap).replace("Z", "+00:00"))
-                local_str = ts.astimezone().strftime("ref %H:%M:%S")
-            except Exception:
-                local_str = None
-            if local_str:
-                tick_font = QFont("Helvetica Neue")
-                tick_font.setPointSize(8)
-                painter.setFont(tick_font)
-                painter.setPen(QColor(200, 200, 215, 150))
-                painter.drawText(x_lbl, self.HEIGHT - 10, local_str)
-
-    def _draw_pair_icon(self, painter, kind: str, x: int, y: int, color: QColor) -> None:
-        """Tiny glyph in place of a row label. kind ∈ {"clock", "calendar"}."""
-        from PyQt5.QtCore import QRect
-        size = 16
-        rect = QRect(x, y, size, size)
-        pen = QPen(color)
-        pen.setWidth(1)
-        painter.setPen(pen)
-        painter.setBrush(Qt.NoBrush)
-        if kind == "clock":
-            # Circle + two hands (12 + 3)
-            painter.drawEllipse(rect)
-            cx = x + size / 2
-            cy = y + size / 2
-            painter.drawLine(int(cx), int(cy), int(cx), int(y + 4))   # minute hand up
-            painter.drawLine(int(cx), int(cy), int(x + size - 4), int(cy))  # hour hand right
-        else:
-            # Calendar: small rectangle with a header bar and a grid notch
-            painter.drawRoundedRect(rect, 2, 2)
-            painter.drawLine(x, y + 5, x + size, y + 5)  # header divider
-            # Two tabs at the top to look like rings
-            painter.drawLine(x + 4, y, x + 4, y + 3)
-            painter.drawLine(x + size - 4, y, x + size - 4, y + 3)
-
-    def _draw_pace_marker(self, painter, rect_tuple, thickness, pace,
-                          pulse_intensity=0.0):
-        """A radial spoke crossing the ring track perpendicular to it.
-
-        Drawn AFTER the fill arc so it's always on top. Extends slightly
-        beyond the ring on both sides for max visibility. The pulse_intensity
-        argument (0..1) modulates the glow halo around the marker — higher
-        = faster, brighter pulse, used to signal "you're overpacing right now."
-        """
-        if pace <= 0:
+        if self._five_hour is None or self._weekly is None:
             return
-        x, y, w, h = rect_tuple
-        cx_local = x + w / 2.0
-        cy_local = y + h / 2.0
-        r = w / 2.0
-        angle_deg = 90 - 360 * pace
-        angle_rad = math.radians(angle_deg)
-        half = thickness / 2.0 + 3
-        x1 = cx_local + math.cos(angle_rad) * (r - half)
-        y1 = cy_local - math.sin(angle_rad) * (r - half)
-        x2 = cx_local + math.cos(angle_rad) * (r + half)
-        y2 = cy_local - math.sin(angle_rad) * (r + half)
 
-        # Soft halo that pulses when overpacing — sin wave of self._anim_phase
-        if pulse_intensity > 0:
-            pulse = (math.sin(self._anim_phase * (1 + pulse_intensity * 2)) + 1) / 2
-            halo_alpha = int(60 + 80 * pulse * pulse_intensity)
-            halo_pen = QPen(QColor(255, 255, 255, halo_alpha))
-            halo_pen.setWidth(int(6 + 4 * pulse_intensity))
-            halo_pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(halo_pen)
-            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        render = self._last_good_official or self._official
+        f5 = self._official_pct("five_hour", render)
+        fw = self._official_pct("seven_day", render)
+        if f5 is None or fw is None:
+            self._paint_waiting(p); return
 
-        pen_outline = QPen(QColor(0, 0, 0, 200))
-        pen_outline.setWidth(4)
-        pen_outline.setCapStyle(Qt.RoundCap)
-        painter.setPen(pen_outline)
-        painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        t = self.RING_THICK
+        ox = self.SIDE_PANEL
+        oi = 20
+        od = self.SIZE - 2 * oi
+        ot = oi + self.RING_TOP
+        ii = oi + t + self.RING_GAP
+        id_ = self.SIZE - 2 * ii
+        it = ii + self.RING_TOP
 
-        pen_line = QPen(QColor(255, 255, 255, 255))
-        pen_line.setWidth(2)
-        pen_line.setCapStyle(Qt.RoundCap)
-        painter.setPen(pen_line)
-        painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        r5  = (ox + oi, ot, od, od)
+        rw  = (ox + ii, it, id_, id_)
+        p5  = self._pace_position(config.FIVE_HOUR_WINDOW)
+        pw  = self._pace_position(config.WEEKLY_WINDOW)
+        d5  = min(f5, 1.0) - p5
+        dw  = min(fw, 1.0) - pw
+        c5  = self._verdict_color(d5, "5h")
+        cw  = self._verdict_color(dw, "weekly")
+        tp5 = p5  # time pressure = pace elapsed
+        self._draw_ring(p, r5, t, min(f5, 1.0), f5, c5, p5, tp5, self._burn_tpm)
+        self._draw_ring(p, rw, t, min(fw, 1.0), fw, cw, pw, pw, 0.0)
+        self._draw_pace_marker(p, r5, t, p5, max(0.0, min(d5 * 2, 1.0)))
+        self._draw_pace_marker(p, rw, t, pw, max(0.0, min(dw * 2, 1.0)))
+        self._draw_ring_pct(p, r5, f5, c5)
+        self._draw_ring_pct(p, rw, fw, cw)
+        self._draw_center_text(p, f5, d5)
+        self._draw_side_panel(p, f5, fw, d5, dw, p5, pw, c5, cw)
+        self._draw_buttons(p)
 
-    def _draw_loaded_ring(
-        self,
-        painter,
-        rect_tuple,
-        thickness,
-        frac,
-        raw_frac,
-        color,
-        pace,
-        time_pressure,
-        burn_tpm,
-    ):
-        x, y, w, h = rect_tuple
-
-        # --- track ---
-        # Very faint neutral grey. Was previously hued + tied to "time pressure"
-        # which made the unfilled portion read like a phantom data arc on darker
-        # palettes. Now it's purely a hairline rail.
-        track_alpha = int(14 + 14 * time_pressure)  # 14..28 max
-        track_pen = QPen(QColor(255, 255, 255, track_alpha))
-        track_pen.setWidth(max(2, thickness - 4))   # thinner than the fill
-        track_pen.setCapStyle(Qt.RoundCap)
-        painter.setPen(track_pen)
-        painter.drawArc(x, y, w, h, 0, 360 * 16)
-
-        # NOTE: pace marker is drawn AFTER the fill arc (in _draw_pace_marker)
-        # so it stays visible regardless of fill state. Skipped here.
-        pass
-
+    def _draw_ring(self, p, rect, thick, frac, raw, color, pace, tp, burn):
+        x, y, w, h = rect
+        # track
+        trk = QPen(QColor(255, 255, 255, int(14 + 14 * tp)))
+        trk.setWidth(max(2, thick - 4)); trk.setCapStyle(Qt.RoundCap)
+        p.setPen(trk); p.drawArc(x, y, w, h, 0, 360 * 16)
         if frac <= 0:
             return
-
-        # --- main filled arc up to min(frac, 1.0) ---
-        # IMPORTANT: trailing end is FlatCap so the rounded cap doesn't bulge
-        # backwards from 12 o'clock and look like a phantom 5-10% arc on the
-        # left side. Leading edge stays rounded for a clean head.
-        fill_pen = QPen(color)
-        fill_pen.setWidth(thickness)
-        fill_pen.setCapStyle(Qt.FlatCap)
-        painter.setPen(fill_pen)
-        start_angle = 90 * 16
-        span = -int(frac * 360 * 16)
-        painter.drawArc(x, y, w, h, start_angle, span)
-
-        # Round just the LEADING edge by drawing a tiny rounded cap at the
-        # tip. This gives the arc a clean head without the backward bulge.
+        # fill arc
+        fp = QPen(color); fp.setWidth(thick); fp.setCapStyle(Qt.FlatCap)
+        p.setPen(fp)
+        p.drawArc(x, y, w, h, 90 * 16, -int(frac * 360 * 16))
         if frac > 0.005:
-            cap_pen = QPen(color)
-            cap_pen.setWidth(thickness)
-            cap_pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(cap_pen)
-            painter.drawArc(x, y, w, h,
-                            int((90 - frac * 360) * 16),
-                            -8)  # half-degree nub at the leading edge
+            cp = QPen(color); cp.setWidth(thick); cp.setCapStyle(Qt.RoundCap)
+            p.setPen(cp)
+            p.drawArc(x, y, w, h, int((90 - frac * 360) * 16), -8)
+        # comet tail
+        if burn > 0:
+            deg = self.MAX_TAIL_DEG * min(burn / self.BURN_FULL_TPM, 1.0)
+            tc = QColor(color); tc.setAlpha(180)
+            tp2 = QPen(tc); tp2.setWidth(thick + 2); tp2.setCapStyle(Qt.RoundCap)
+            p.setPen(tp2)
+            lead = 90 - 360 * frac
+            p.drawArc(x, y, w, h, int((lead + deg) * 16), -int(deg * 16))
+        # overflow dashed
+        if raw > 1.0:
+            ov = min(raw - 1.0, 0.5)
+            dp = QPen(color); dp.setWidth(thick); dp.setCapStyle(Qt.FlatCap)
+            dp.setStyle(Qt.DashLine); p.setPen(dp)
+            p.drawArc(x, y, w, h, 90 * 16, -int(ov * 360 * 16))
 
-        # --- feature 3: comet tail ---
-        # A second arc OVERLAID on the leading-edge portion, brighter & wider.
-        # Length proportional to recent burn rate. Only on the 5h ring (burn_tpm=0 for weekly).
-        if burn_tpm > 0:
-            tail_frac = min(burn_tpm / self.BURN_FULL_TAIL_TPM, 1.0)
-            tail_deg = self.MAX_TAIL_DEGREES * tail_frac
-            tail_color = QColor(color)
-            tail_color.setAlpha(180)
-            tail_pen = QPen(tail_color)
-            tail_pen.setWidth(thickness + 2)  # slightly wider to "glow"
-            tail_pen.setCapStyle(Qt.RoundCap)
-            painter.setPen(tail_pen)
-            # Tail extends BACKWARDS from the leading edge (against direction of travel)
-            lead_angle_deg = 90 - 360 * frac
-            tail_start_deg = lead_angle_deg + tail_deg  # behind leading edge
-            tail_span_deg = -tail_deg
-            painter.drawArc(
-                x, y, w, h,
-                int(tail_start_deg * 16),
-                int(tail_span_deg * 16),
-            )
+    def _draw_pace_marker(self, p, rect, thick, pace, pulse_i=0.0):
+        if pace <= 0:
+            return
+        x, y, w, h = rect
+        cx, cy, r = x + w / 2, y + h / 2, w / 2
+        ang = math.radians(90 - 360 * pace)
+        half = thick / 2 + 3
+        x1 = cx + math.cos(ang) * (r - half); y1 = cy - math.sin(ang) * (r - half)
+        x2 = cx + math.cos(ang) * (r + half); y2 = cy - math.sin(ang) * (r + half)
+        if pulse_i > 0:
+            pulse = (math.sin(self._anim_phase * (1 + pulse_i * 2)) + 1) / 2
+            hp = QPen(QColor(255, 255, 255, int(60 + 80 * pulse * pulse_i)))
+            hp.setWidth(int(6 + 4 * pulse_i)); hp.setCapStyle(Qt.RoundCap)
+            p.setPen(hp); p.drawLine(int(x1), int(y1), int(x2), int(y2))
+        for pen in (QPen(QColor(0, 0, 0, 200)), QPen(QColor(255, 255, 255, 255))):
+            pen.setWidth(4 if pen.color().alpha() < 255 else 2)
+            pen.setCapStyle(Qt.RoundCap); p.setPen(pen)
+            p.drawLine(int(x1), int(y1), int(x2), int(y2))
 
-        # --- feature 7: dotted overflow ---
-        # When raw_frac > 1.0, draw the overflow portion as a dashed arc
-        # in the SAME color (so it's visually continuous) but with a dash pattern.
-        if raw_frac > 1.0:
-            overflow = min(raw_frac - 1.0, 0.5)  # cap visual overflow at +50%
-            dash_pen = QPen(color)
-            dash_pen.setWidth(thickness)
-            dash_pen.setCapStyle(Qt.FlatCap)
-            dash_pen.setStyle(Qt.DashLine)
-            painter.setPen(dash_pen)
-            # Overflow continues from where the full ring ended.
-            # 100% point: angle = 90 - 360 = -270 (which is the same as 90° — full circle).
-            # We start the dashed arc at 90° and continue clockwise into a second lap.
-            overflow_start_deg = 90
-            overflow_span_deg = -overflow * 360
-            painter.drawArc(
-                x, y, w, h,
-                int(overflow_start_deg * 16),
-                int(overflow_span_deg * 16),
-            )
+    def _draw_ring_pct(self, p, rect, frac, color):
+        x, y, w, h = rect
+        tx, ty = x + w / 2, y + h
+        txt = f"{int(round(frac * 100))}%"
+        f = QFont("Helvetica Neue"); f.setPointSize(11); f.setBold(True)
+        p.setFont(f); fm = p.fontMetrics()
+        pw2, ph = fm.horizontalAdvance(txt), fm.ascent()
+        pad = 6, 3
+        pill_w, pill_h = pw2 + pad[0] * 2, ph + pad[1] * 2
+        px, py = int(tx - pill_w / 2), int(ty - pill_h / 2)
+        p.setPen(Qt.NoPen); p.setBrush(QColor(15, 17, 22, 220))
+        p.drawRoundedRect(px, py, pill_w, pill_h, 6, 6)
+        p.setPen(color)
+        p.drawText(int(tx - pw2 / 2), int(py + pad[1] + ph - 1), txt)
 
-    def _window_time_left(self, stats, window_hours: float) -> str:
-        """Time remaining until the window resets, per Anthropic's own clock.
+    def _draw_buttons(self, p):
+        import math as _m
+        for rect, draw_fn in ((self._chev_rect(), self._draw_chev),
+                              (self._refresh_rect(), self._draw_refresh_icon)):
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 26 if rect == self._chev_rect() else 36))
+            p.drawEllipse(rect)
+            draw_fn(p, rect)
 
-        Anthropic's "5h window" is NOT a rolling window that starts when you
-        start working — it's a fixed slot with a hard `resets_at` epoch on
-        every rate-limit response. We use that as the source of truth.
-        Falls back to the earliest-sample heuristic only when no live data.
-        """
-        # Prefer the authoritative resets_at from the official block.
-        key = "five_hour" if window_hours <= 6 else "seven_day"
-        rl = (self._official or {}).get("rate_limits") or {}
-        block = rl.get(key) or {}
-        ts = block.get("resets_at")
-        if ts is not None:
+    def _draw_chev(self, p, rect):
+        pen = QPen(QColor(230, 230, 240, 220)); pen.setWidth(2)
+        pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        cx, cy, s = rect.x() + rect.width() / 2, rect.y() + rect.height() / 2, 4.0
+        p.drawLine(int(cx - s), int(cy - s + 1), int(cx), int(cy + s - 1))
+        p.drawLine(int(cx), int(cy + s - 1), int(cx + s), int(cy - s + 1))
+
+    def _draw_refresh_icon(self, p, rect):
+        import math as _m
+        cx, cy = rect.x() + rect.width() / 2, rect.y() + rect.height() / 2
+        r = rect.width() / 2 - 5
+        pen = QPen(QColor(230, 230, 240, 230)); pen.setWidth(2); pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen); p.setBrush(Qt.NoBrush)
+        p.drawArc(int(cx - r), int(cy - r), int(r * 2), int(r * 2), 90 * 16, -300 * 16)
+        er = _m.radians(90 - 300)
+        tx, ty = cx + r * _m.cos(er), cy - r * _m.sin(er)
+        for da in (0.5, -0.5):
+            ax, ay = tx + 4 * _m.cos(er + _m.pi / 2 + da), ty - 4 * _m.sin(er + _m.pi / 2 + da)
+            p.drawLine(int(tx), int(ty), int(ax), int(ay))
+
+    def _paint_dot(self, p):
+        rect = self.rect(); pad = 2
+        inner = rect.adjusted(pad, pad, -pad, -pad)
+        f5 = 0.0; color = QColor(150, 150, 170, 220); over = 0.0
+        if self._five_hour is not None and self._official:
+            f5 = self._official_pct("five_hour") or 0.0
+            pace = self._pace_position(config.FIVE_HOUR_WINDOW)
+            delta = min(f5, 1.0) - pace
+            color = self._verdict_color(delta, "5h")
+            over = max(0.0, delta)
+        if over > 0.05:
+            pulse = (math.sin(self._anim_phase * (1 + over * 2)) + 1) / 2
+            halo = QColor(color); halo.setAlpha(int(40 + 70 * pulse * min(over * 4, 1.0)))
+            p.setPen(Qt.NoPen); p.setBrush(halo); p.drawEllipse(rect)
+        p.setPen(Qt.NoPen); p.setBrush(QColor(15, 17, 22, 240)); p.drawEllipse(inner)
+        # pillar fill
+        clip = QPainterPath(); clip.addEllipse(QRectF(inner))
+        p.save(); p.setClipPath(clip)
+        fh = inner.height() * max(0.0, min(f5, 1.0))
+        p.setBrush(self._bright(color))
+        p.drawRect(QRectF(float(inner.x()), float(inner.bottom()) - fh, float(inner.width()), fh))
+        p.restore()
+        rp = QPen(color); rp.setWidth(2); p.setPen(rp); p.setBrush(Qt.NoBrush); p.drawEllipse(inner)
+        # show just the 5h % in the center of the dot
+        if f5 > 0:
+            pct = f"{int(round(min(f5, 1.0) * 100))}%"
+            fnt = QFont("Menlo"); fnt.setPointSize(8); fnt.setBold(True)
+            p.setFont(fnt); fm = p.fontMetrics()
+            tw = fm.horizontalAdvance(pct); th = fm.ascent()
+            pad = 4, 2; pw2 = tw + pad[0] * 2; ph2 = th + pad[1] * 2
+            cx = inner.x() + inner.width() / 2; cy = inner.y() + inner.height() / 2
+            px_ = int(cx - pw2 / 2); py_ = int(cy - ph2 / 2)
+            p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 215))
+            p.drawRoundedRect(px_, py_, pw2, ph2, 5, 5)
+            p.setPen(self._bright(color))
+            p.drawText(int(cx - tw / 2), int(py_ + pad[1] + th - 1), pct)
+
+    def _paint_waiting(self, p):
+        ox = self.SIDE_PANEL; oi = 14; od = self.SIZE - 2 * oi; ot = oi + self.RING_TOP
+        ii = oi + self.RING_THICK + self.RING_GAP; id_ = self.SIZE - 2 * ii; it = ii + self.RING_TOP
+        for idx, (rect, t) in enumerate([
+            ((ox + oi, ot, od, od), self.RING_THICK),
+            ((ox + ii, it, id_, id_), self.RING_THICK),
+        ]):
+            x, y, w, h = rect
+            tp = QPen(QColor(255, 255, 255, 20)); tp.setWidth(t); tp.setCapStyle(Qt.RoundCap)
+            p.setPen(tp); p.drawArc(x, y, w, h, 0, 360 * 16)
+            sp = QPen(QColor(110, 220, 255, 110)); sp.setWidth(t); sp.setCapStyle(Qt.RoundCap)
+            p.setPen(sp)
+            phase = self._anim_phase * (1.0 if idx == 0 else 0.7)
+            start = int(((phase / (2 * math.pi)) * 360 + idx * 180) * 16) % (360 * 16)
+            p.drawArc(x, y, w, h, start, -int(40 * 16))
+        cx = self.SIDE_PANEL + self.SIZE / 2; cy = self.SIZE / 2 + self.RING_TOP
+        f = QFont("Helvetica Neue"); f.setPointSize(9); f.setBold(True); p.setFont(f)
+        p.setPen(QColor(255, 255, 255, 130))
+        fm = p.fontMetrics(); msg = "—"
+        p.drawText(int(cx - fm.horizontalAdvance(msg) / 2), int(cy - 4), msg)
+        f2 = QFont("Helvetica Neue"); f2.setPointSize(7); p.setFont(f2)
+        p.setPen(QColor(255, 255, 255, 90))
+        fm2 = p.fontMetrics()
+        for i, sub in enumerate(("no live data", "open a claude session")):
+            p.drawText(int(cx - fm2.horizontalAdvance(sub) / 2), int(cy + 10 + i * 12), sub)
+
+    def _draw_side_panel(self, p, f5, fw, d5, dw, p5, pw, c5, cw):
+        xl, xtrack, tw = 14, 14, self.SIDE_PANEL - 28
+        pulse = (math.sin(self._anim_phase) + 1) / 2
+        vf = QFont("Helvetica Neue"); vf.setPointSize(12); vf.setBold(True)
+        rf = QFont("Helvetica Neue"); rf.setPointSize(8)
+        rows = [("clock", f5, p5, c5, "five_hour"), ("calendar", fw, pw, cw, "seven_day")]
+        for i, (icon, fill, time_v, color, rl_key) in enumerate(rows):
+            ytop = 38 + i * 60; ytrack = ytop + 22
+            # icon
+            self._draw_icon(p, icon, xl, ytop - 4, color)
+            sf = QFont("Helvetica Neue"); sf.setPointSize(9); sf.setBold(True); p.setFont(sf)
+            p.setPen(QColor(255, 255, 255, 220))
+            p.drawText(xl + 20, ytop + 8, "5h" if icon == "clock" else "wk")
+            # rail
+            ro = 46; tleft = xtrack + ro; tright = tleft + (tw - ro); tspan = tright - tleft
+            rp2 = QPen(QColor(255, 255, 255, 55)); rp2.setWidth(4); rp2.setCapStyle(Qt.RoundCap)
+            p.setPen(rp2); p.drawLine(tleft, ytrack, tright, ytrack)
+            fx = int(tleft + min(fill, 1.0) * tspan)
+            tx2 = int(tleft + min(time_v, 1.0) * tspan)
+            # fill
+            fp2 = QPen(color); fp2.setWidth(6); fp2.setCapStyle(Qt.RoundCap)
+            p.setPen(fp2); p.drawLine(tleft, ytrack, fx, ytrack)
+            # knob halo
+            hr = int(11 + pulse * 3)
+            hc = QColor(color); hc.setAlpha(int(60 + pulse * 90))
+            p.setPen(Qt.NoPen); p.setBrush(hc)
+            p.drawEllipse(fx - hr, ytrack - hr, hr * 2, hr * 2)
+            p.setBrush(self._bright(color))
+            p.drawEllipse(fx - 6, ytrack - 6, 12, 12)
+            # time tick
+            for pen in (QPen(QColor(0, 0, 0, 200)), QPen(QColor(255, 255, 255, 235))):
+                pen.setWidth(5 if pen.color().alpha() < 255 else 2); pen.setCapStyle(Qt.RoundCap)
+                p.setPen(pen); p.drawLine(tx2, ytrack - 7, tx2, ytrack + 7)
+            # pct value
+            p.setFont(vf); p.setPen(self._bright(color))
+            pct = f"{int(round(min(fill, 1.0) * 100))}%"
+            fm = p.fontMetrics()
+            p.drawText(int(tright - fm.horizontalAdvance(pct)), int(ytop - 2), pct)
+            # reset time
+            rt = self._reset_wall(rl_key)
+            if rt:
+                p.setFont(rf); dc = QColor(color); dc.setAlpha(170)
+                p.setPen(dc); p.drawText(tleft, ytrack + 16, rt)
+        # ref timestamp
+        cap = (self._official or {}).get("captured_at") if self._official else None
+        if cap:
+            from datetime import datetime
             try:
-                from datetime import datetime, timezone
-                if isinstance(ts, (int, float)):
-                    reset_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                else:
-                    reset_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-                secs = max(0, int((reset_dt - datetime.now(timezone.utc)).total_seconds()))
-                if secs < 60:
-                    return f"{secs}s"
-                if secs < 3600:
-                    return f"{secs // 60}m"
-                if secs < 86400:
-                    h = secs // 3600
-                    m = (secs % 3600) // 60
-                    return f"{h}h {m}m" if m else f"{h}h"
-                d = secs // 86400
-                h = (secs % 86400) // 3600
-                return f"{d}d {h}h" if h else f"{d}d"
+                ts = datetime.fromisoformat(str(cap).replace("Z", "+00:00"))
+                ls = ts.astimezone().strftime("ref %H:%M:%S")
+                tf = QFont("Helvetica Neue"); tf.setPointSize(8); p.setFont(tf)
+                p.setPen(QColor(200, 200, 215, 150))
+                p.drawText(xl, self.HEIGHT - 10, ls)
             except Exception:
                 pass
 
-        # Fallback: transcript-based heuristic.
-        if stats is None or stats.earliest is None:
-            return f"{int(window_hours)}h"
-        now = counter.now_utc()
-        elapsed = (now - stats.earliest).total_seconds() / 60.0  # min
-        total = window_hours * 60.0
-        left = max(total - elapsed, 0)
-        if left < 60:
-            return f"{int(round(left))}m"
-        h = int(left // 60)
-        m = int(round(left % 60))
-        if m == 0:
-            return f"{h}h"
-        return f"{h}h {m}m"
+    def _draw_icon(self, p, kind, x, y, color):
+        size = 16; rect = QRect(x, y, size, size)
+        pen = QPen(color); pen.setWidth(1); p.setPen(pen); p.setBrush(Qt.NoBrush)
+        if kind == "clock":
+            p.drawEllipse(rect)
+            cx2, cy2 = x + size / 2, y + size / 2
+            p.drawLine(int(cx2), int(cy2), int(cx2), y + 4)
+            p.drawLine(int(cx2), int(cy2), x + size - 4, int(cy2))
+        else:
+            p.drawRoundedRect(rect, 2, 2); p.drawLine(x, y + 5, x + size, y + 5)
+            p.drawLine(x + 4, y, x + 4, y + 3); p.drawLine(x + size - 4, y, x + size - 4, y + 3)
 
-    def _verdict_word(self, delta: float) -> str:
-        """delta = actual - expected (fraction units).
-           +0.10 means 'arc is 10 percentage points past the marker.'
-        """
-        if delta >= 0.25:
-            return "STOP"
-        if delta >= 0.12:
-            return "SLOW"
-        if delta >= 0.05:
-            return "EASE"
-        if delta >= -0.05:
-            return "ON PACE"
-        if delta >= -0.15:
-            return "FINE"
-        return "REST EASY"
-
-    def _draw_center_text(self, painter, frac5, fracw, delta5, deltaw):
-        cx = self.SIDE_PANEL + self.SIZE / 2
-        cy = self.SIZE / 2 + self.RING_TOP_OFFSET
-
-        color5 = self._verdict_color(delta5, "5h")
-
-        # Center stack — three equal-size lines, distinguished by weight and
-        # alpha rather than by font size:
-        #   line 1 (top)    : NN% USED  — color + light  (the *what*)
-        #   line 2 (middle) : ON PACE   — color + heavy  (the *verdict*, primary)
-        #   line 3 (bottom) : 4h 43m    — color + bold   (the *time*)
-        # Wall-clock reset time lives in the side panel, not here.
-        line_font = QFont("Helvetica Neue")
-        line_font.setPointSize(11)
-        painter.setFont(line_font)
-        fm = painter.fontMetrics()
-        line_h = fm.height()
-
-        pct_str = f"{int(round(min(frac5, 1.0) * 100))}% USED"
-        win_left = self._window_time_left(self._five_hour, config.FIVE_HOUR_WINDOW)
-        verdict = self._verdict_word(delta5)
-
-        # Slightly different alphas/weights per line.
-        dim_color = QColor(color5)
-        dim_color.setAlpha(190)
-        bright_color = QColor(min(color5.red() + 25, 255),
-                              min(color5.green() + 25, 255),
-                              min(color5.blue() + 25, 255), 255)
-
-        lines = (
-            (pct_str,  QFont.Medium,    dim_color),
-            (verdict,  QFont.Black,     bright_color),
-            (win_left, QFont.Bold,      color5),
-        )
-
-        block_top = cy - line_h * 1.5 + fm.ascent()
-        for i, (text_line, weight, color) in enumerate(lines):
-            f = QFont(line_font)
-            f.setWeight(weight)
-            painter.setFont(f)
-            painter.setPen(color)
-            fm_line = painter.fontMetrics()
-            tw = fm_line.horizontalAdvance(text_line)
-            painter.drawText(int(cx - tw / 2),
-                             int(block_top + i * line_h),
-                             text_line)
-
-        # Stale-data warning: if the captured_at is older than 90s, draw a
-        # tiny "stale Xm" pill below the center stack so the user knows the
-        # numbers aren't live. The hook only fires from terminal Claude
-        # sessions, so VSCode-only work drifts.
-        stale_secs = self._data_age_seconds()
-        if stale_secs is not None and stale_secs > 150:  # 2.5× AUTO_REFRESH_SECONDS
-            mins = int(stale_secs // 60)
-            stale_text = f"stale {mins}m" if mins >= 1 else f"stale {int(stale_secs)}s"
-            stale_font = QFont("Helvetica Neue")
-            stale_font.setPointSize(8)
-            stale_font.setBold(True)
-            painter.setFont(stale_font)
-            fm_s = painter.fontMetrics()
-            sw = fm_s.horizontalAdvance(stale_text)
-            sh = fm_s.height()
-            pad_x, pad_y = 6, 2
-            pill_w = sw + pad_x * 2
-            pill_h = sh + pad_y
-            px = int(cx - pill_w / 2)
-            py = int(block_top + 3 * line_h + 4)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(200, 100, 60, 220))
-            painter.drawRoundedRect(px, py, pill_w, pill_h, 6, 6)
-            painter.setPen(QColor(15, 17, 22, 255))
-            painter.drawText(int(cx - sw / 2),
-                             int(py + pad_y + fm_s.ascent() - 1),
-                             stale_text)
+    def _draw_center_text(self, p, f5, d5):
+        cx = self.SIDE_PANEL + self.SIZE / 2; cy = self.SIZE / 2 + self.RING_TOP
+        c = self._verdict_color(d5, "5h")
+        dim = QColor(c); dim.setAlpha(190)
+        bright = self._bright(c)
+        lf = QFont("Helvetica Neue"); lf.setPointSize(11); p.setFont(lf)
+        fm = p.fontMetrics(); lh = fm.height()
+        lines = [
+            (f"{int(round(min(f5, 1.0) * 100))}% USED", QFont.Medium, dim),
+            (self._verdict_word(d5),                     QFont.Black,  bright),
+            (self._time_left("five_hour", config.FIVE_HOUR_WINDOW, self._five_hour), QFont.Bold, c),
+        ]
+        top = cy - lh * 1.5 + fm.ascent()
+        for i, (txt, wt, col) in enumerate(lines):
+            f2 = QFont(lf); f2.setWeight(wt); p.setFont(f2); p.setPen(col)
+            fm2 = p.fontMetrics()
+            p.drawText(int(cx - fm2.horizontalAdvance(txt) / 2), int(top + i * lh), txt)
+        # stale warning
+        age = self._data_age_seconds()
+        if age is not None and age > 150:
+            mins = int(age // 60)
+            stxt = f"stale {mins}m" if mins >= 1 else f"stale {int(age)}s"
+            sf = QFont("Helvetica Neue"); sf.setPointSize(8); sf.setBold(True); p.setFont(sf)
+            fm3 = p.fontMetrics(); sw = fm3.horizontalAdvance(stxt); sh = fm3.height()
+            px3, py3 = 6, 2; pw3 = sw + px3 * 2; ph3 = sh + py3
+            px4 = int(cx - pw3 / 2); py4 = int(top + 3 * lh + 4)
+            p.setPen(Qt.NoPen); p.setBrush(QColor(200, 100, 60, 220))
+            p.drawRoundedRect(px4, py4, pw3, ph3, 6, 6)
+            p.setPen(QColor(15, 17, 22, 255))
+            p.drawText(int(cx - sw / 2), int(py4 + py3 + fm3.ascent() - 1), stxt)
 
 
 def main() -> int:
@@ -1487,8 +715,6 @@ def main() -> int:
     app.setQuitOnLastWindowClosed(True)
     widget = MeterWidget()
     widget.show()
-    # Clean up the headless claude pty (if one was spawned) on exit so we
-    # don't leave orphan claude processes behind when the meter quits.
     def _on_quit():
         try:
             from . import pty_session
