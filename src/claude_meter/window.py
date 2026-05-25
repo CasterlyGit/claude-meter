@@ -24,14 +24,11 @@ from __future__ import annotations
 import json
 import math
 import sys
-from datetime import datetime, timedelta
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer, QPoint
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen
 from PyQt5.QtWidgets import QApplication, QWidget
-
-from PyQt5.QtCore import QEvent  # noqa: E402  — grouped after QWidget on purpose
 
 from claude_meter import config, counter
 from claude_meter.mac_window import make_always_visible
@@ -40,23 +37,47 @@ from claude_meter.mac_window import make_always_visible
 POSITION_FILE = Path.home() / ".claude" / "state" / "claude-meter-position.json"
 
 
-def _load_saved_position() -> tuple[int, int] | None:
-    """Return saved (x, y) global pos, or None if missing/corrupt."""
+def _load_state() -> dict:
+    """Return persisted UI state (position + collapsed flag). Missing/corrupt
+    files return an empty dict."""
     try:
         with POSITION_FILE.open() as fh:
             data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _load_saved_position() -> tuple[int, int] | None:
+    data = _load_state()
+    try:
         return int(data["x"]), int(data["y"])
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError):
         return None
 
 
-def _save_position(x: int, y: int) -> None:
+def _load_saved_collapsed() -> bool:
+    return bool(_load_state().get("collapsed", False))
+
+
+def _save_state(**updates) -> None:
+    """Merge updates into the persisted state file."""
     try:
         POSITION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = _load_state()
+        data.update(updates)
         with POSITION_FILE.open("w") as fh:
-            json.dump({"x": int(x), "y": int(y)}, fh)
+            json.dump(data, fh)
     except OSError:
         pass
+
+
+def _save_position(x: int, y: int) -> None:
+    _save_state(x=int(x), y=int(y))
+
+
+def _save_collapsed(collapsed: bool) -> None:
+    _save_state(collapsed=bool(collapsed))
 
 
 class MeterWidget(QWidget):
@@ -75,6 +96,9 @@ class MeterWidget(QWidget):
     MAX_RING_THICKNESS = 18
     MIN_RING_THICKNESS = 8
     RING_GAP = 4
+    # Push the ring stack down so the top-left buttons get visual breathing
+    # room and the rings sit closer to vertical center of the widget.
+    RING_TOP_OFFSET = 14
 
     # Burn-rate scale: 50k tokens/min = full comet tail.
     BURN_FULL_TAIL_TPM = 50_000
@@ -86,13 +110,22 @@ class MeterWidget(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setFixedSize(self.WIDTH, self.HEIGHT)
+        # Restore the last user-chosen collapsed/expanded state so the dot
+        # stays out of the way across restarts instead of always re-expanding.
+        self._collapsed: bool = _load_saved_collapsed()
+        if self._collapsed:
+            self.setFixedSize(self.DOT_SIZE, self.DOT_SIZE)
+        else:
+            self.setFixedSize(self.WIDTH, self.HEIGHT)
 
         self._five_hour: counter.WindowStats | None = None
         self._weekly: counter.WindowStats | None = None
         self._burn_tpm: float = 0.0  # recent burn rate (last 5 min)
-        self._collapsed: bool = False
         self._official: dict | None = None
+        # Sticky copy of the last *successful* official read. Never cleared once
+        # set, so a transient read error (file lock, parse hiccup) doesn't flash
+        # the waiting-state spinner — we just keep showing the previous numbers.
+        self._last_good_official: dict | None = None
         # Set true while the refresh script is in flight; cleared when the
         # rate-limits file picks up a newer captured_at than this snapshot.
         self._refresh_pending: bool = False
@@ -126,6 +159,13 @@ class MeterWidget(QWidget):
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.timeout.connect(self._auto_refresh_tick)
         self._auto_refresh_timer.start(config.AUTO_REFRESH_SECONDS * 1000)
+        from datetime import datetime
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] claude-meter started; "
+            f"pty auto-refresh every {config.AUTO_REFRESH_SECONDS}s (unconditional)",
+            file=sys.stderr,
+            flush=True,
+        )
 
         # Animation tick: drives the comet tail rotation and pace pulse
         self._anim_phase = 0.0
@@ -221,23 +261,26 @@ class MeterWidget(QWidget):
         # Stay where the user dragged us, just nudge back on-screen if the
         # size change pushed an edge past the screen boundary.
         self._clamp_to_visible_screen()
+        # Persist so the user's choice survives launchd restarts.
+        _save_collapsed(collapsed)
         self.update()
 
     def _chev_rect(self):
-        """Rect of the collapse chevron in the expanded widget (top-right corner)."""
+        """Rect of the collapse chevron in the expanded widget (top-left corner)."""
         from PyQt5.QtCore import QRect
         return QRect(
-            self.WIDTH - self.CHEV_SIZE - self.CHEV_MARGIN,
+            self.CHEV_MARGIN,
             self.CHEV_MARGIN,
             self.CHEV_SIZE,
             self.CHEV_SIZE,
         )
 
     def _refresh_rect(self):
-        """Rect of the refresh button — sits to the LEFT of the chevron."""
+        """Rect of the refresh button — sits to the RIGHT of the chevron in
+        the top-left button cluster."""
         from PyQt5.QtCore import QRect
         return QRect(
-            self.WIDTH - 2 * self.CHEV_SIZE - 2 * self.CHEV_MARGIN,
+            self.CHEV_MARGIN * 2 + self.CHEV_SIZE,
             self.CHEV_MARGIN,
             self.CHEV_SIZE,
             self.CHEV_SIZE,
@@ -251,11 +294,11 @@ class MeterWidget(QWidget):
         from . import pty_session
         if self._refresh_pending:
             return  # already in-flight; don't double-spend tokens
+        # send_prompt is fire-and-forget and pty_session de-dupes concurrent
+        # calls itself, so we don't need to check its return value.
         try:
-            ok = pty_session.refresh()
+            pty_session.refresh()
         except Exception:
-            ok = False
-        if not ok:
             return
         self._refresh_pending = True
         self._refresh_recycled = False
@@ -271,9 +314,15 @@ class MeterWidget(QWidget):
         # the respawned TUI's first statusline tick hits the file.
         for delay_ms in (9000, 11000, 13000, 16000, 19000, 22000):
             QTimer.singleShot(delay_ms, self._refresh_data)
-        # Safety: hard-clear the pending flag after 25s even if recycle
-        # also failed (no network, auth broken, etc).
-        QTimer.singleShot(25_000, self._clear_refresh_pending)
+        # Cold-spawn poll window. The very first refresh after a meter
+        # restart has to wait for the headless TUI to finish booting
+        # (auth check, trust dialog, splash) — empirically ~108s before
+        # "ok" actually lands and the statusline fires.
+        for delay_ms in (30_000, 40_000, 55_000, 70_000, 90_000, 110_000, 125_000):
+            QTimer.singleShot(delay_ms, self._refresh_data)
+        # Safety: hard-clear the pending flag after 130s even if recycle
+        # also failed (no network, auth broken, etc). Covers cold spawns.
+        QTimer.singleShot(130_000, self._clear_refresh_pending)
         self.update()
 
     def _maybe_recycle_pty(self) -> None:
@@ -289,18 +338,18 @@ class MeterWidget(QWidget):
             pass
 
     def _auto_refresh_tick(self) -> None:
-        """Background tick — fires a refresh only when the captured data is
-        actually stale enough to need one. Skips if a manual refresh is
-        already in flight (so the user clicking refresh + the timer firing
-        don't double-spend tokens)."""
+        """Background tick — always fires a pty refresh so we get current
+        rate-limit headers from the API. The statusline hook updates
+        captured_at every 30 s even when the rate-limit VALUES haven't
+        changed, so age-based skipping gives a false sense of freshness.
+        Only skip if a refresh is already in flight."""
+        from datetime import datetime
+        ts = datetime.now().strftime("%H:%M:%S")
         if self._refresh_pending:
+            print(f"[{ts}] auto-refresh tick: skip (in-flight)", file=sys.stderr, flush=True)
             return
-        age = self._data_age_seconds()
-        # If there's no data yet, or it's older than ~one interval, refresh.
-        # The -30s slack lets us still refresh on time when the previous
-        # refresh landed slightly late.
-        if age is None or age >= config.AUTO_REFRESH_SECONDS - 30:
-            self._run_refresh()
+        print(f"[{ts}] auto-refresh tick: FIRING", file=sys.stderr, flush=True)
+        self._run_refresh()
 
     def _clear_refresh_pending(self) -> None:
         if self._refresh_pending:
@@ -355,12 +404,10 @@ class MeterWidget(QWidget):
             return
         # Not a drag — interpret as a click on whatever the cursor is over.
         if self._collapsed:
+            # Expand instantly. No auto-refresh kicked here — auto-tick
+            # keeps the data fresh in the background; the user wants
+            # snap UI, not a wait-for-the-spinner round trip.
             self._set_collapsed(False)
-            # Expanding from the dot also kicks a refresh — the user is
-            # coming back to look at the numbers, so re-fetch like a
-            # reload click would. Cheap (~half a cent) and matches the
-            # mental model that "showing me the meter again" = fresh data.
-            self._run_refresh()
             event.accept()
             return
         if self._chev_rect().contains(press_pos):
@@ -384,6 +431,8 @@ class MeterWidget(QWidget):
             self._weekly = counter.stats_for_window(now, config.WEEKLY_WINDOW)
             self._burn_tpm = counter.burn_rate_last_n_minutes(now, 30.0)
             self._official = counter.read_official_rate_limits()
+            if self._official is not None:
+                self._last_good_official = self._official
         except Exception:
             return
         # If a refresh was in flight, clear the pending flag once we see a
@@ -396,11 +445,15 @@ class MeterWidget(QWidget):
                 self._refresh_recycled = False
         self.update()
 
-    def _official_pct(self, key: str) -> float | None:
-        """Return five_hour or seven_day percentage from Claude's own data."""
-        if not self._official:
+    def _official_pct(self, key: str, source: dict | None = None) -> float | None:
+        """Return five_hour or seven_day percentage from Claude's own data.
+
+        `source` defaults to self._official; callers can pass _last_good_official
+        to avoid flashing the waiting state on transient read errors."""
+        data = source if source is not None else self._official
+        if not data:
             return None
-        rl = (self._official or {}).get("rate_limits") or {}
+        rl = (data or {}).get("rate_limits") or {}
         block = rl.get(key)
         if not block:
             return None
@@ -422,15 +475,6 @@ class MeterWidget(QWidget):
         except Exception:
             return None
         return (datetime.now(timezone.utc) - ts).total_seconds()
-
-    def _official_resets_at(self, key: str) -> str | None:
-        if not self._official:
-            return None
-        rl = (self._official or {}).get("rate_limits") or {}
-        block = rl.get(key)
-        if not block:
-            return None
-        return block.get("resets_at")
 
     # ---- color = pace-vs-actual delta ----
     # The dominant fill color tells you whether you're burning faster than
@@ -568,8 +612,11 @@ class MeterWidget(QWidget):
         if self._five_hour is None or self._weekly is None:
             return
 
-        official5 = self._official_pct("five_hour")
-        officialw = self._official_pct("seven_day")
+        # Use the sticky last-good snapshot so a transient file-read failure
+        # (lock, parse error) doesn't flash the animated waiting-state arcs.
+        render_official = self._last_good_official or self._official
+        official5 = self._official_pct("five_hour", render_official)
+        officialw = self._official_pct("seven_day", render_official)
         if official5 is None or officialw is None:
             self._draw_waiting_state(painter)
             return
@@ -584,12 +631,14 @@ class MeterWidget(QWidget):
 
         outer_inset = 20  # scaled with SIZE
         outer_diam = self.SIZE - 2 * outer_inset
-        outer_rect = (self._ring_origin_x + outer_inset, outer_inset, outer_diam, outer_diam)
+        outer_top = outer_inset + self.RING_TOP_OFFSET
+        outer_rect = (self._ring_origin_x + outer_inset, outer_top, outer_diam, outer_diam)
 
         # Inner inset depends on outer thickness
         inner_inset = outer_inset + t5 + self.RING_GAP
         inner_diam = self.SIZE - 2 * inner_inset
-        inner_rect = (self._ring_origin_x + inner_inset, inner_inset, inner_diam, inner_diam)
+        inner_top = inner_inset + self.RING_TOP_OFFSET
+        inner_rect = (self._ring_origin_x + inner_inset, inner_top, inner_diam, inner_diam)
 
         pace5 = self._pace_position(config.FIVE_HOUR_WINDOW)
         pacew = self._pace_position(config.WEEKLY_WINDOW)
@@ -689,8 +738,8 @@ class MeterWidget(QWidget):
         painter.setBrush(QColor(255, 255, 255, 26))
         painter.drawEllipse(rect)
 
-        # Draw a ">" pointing right (toward the edge of the screen) — visual
-        # metaphor: "tuck me away to the right."
+        # Draw a "v" pointing down — visual metaphor: "collapse downward
+        # to the puck." Reads naturally as "minimize / fold away."
         chev_pen = QPen(QColor(230, 230, 240, 220))
         chev_pen.setWidth(2)
         chev_pen.setCapStyle(Qt.RoundCap)
@@ -699,35 +748,30 @@ class MeterWidget(QWidget):
         cx = rect.x() + rect.width() / 2
         cy = rect.y() + rect.height() / 2
         s = 4.0  # arm length
-        # ">" shape
-        painter.drawLine(int(cx - s + 1), int(cy - s),
-                         int(cx + s - 1), int(cy))
-        painter.drawLine(int(cx + s - 1), int(cy),
-                         int(cx - s + 1), int(cy + s))
+        # "v" shape — two diagonals meeting at the bottom center
+        painter.drawLine(int(cx - s), int(cy - s + 1),
+                         int(cx), int(cy + s - 1))
+        painter.drawLine(int(cx), int(cy + s - 1),
+                         int(cx + s), int(cy - s + 1))
 
     def _draw_refresh_button(self, painter):
-        """Circular-arrow refresh icon, left of the chevron. Click =
-        explicit token-spending refresh of the rate-limits file.
-        Greyed out while a refresh is in flight (clicks are no-ops then)."""
+        """Circular-arrow refresh icon in the top-left button cluster.
+        Rendered identically whether or not a refresh is in flight — the user
+        explicitly does not want a visible spinner. All slow work happens in
+        a background thread; the icon stays a calm, static affordance."""
         import math as _m
         rect = self._refresh_rect()
-        pending = self._refresh_pending
 
-        # background hit target — dimmer + flatter when disabled (pending),
-        # normal when idle. Was previously *brighter* while pending which
-        # made the disabled state look more inviting; reversed it.
         painter.setPen(Qt.NoPen)
-        bg_alpha = 14 if pending else 36
-        painter.setBrush(QColor(255, 255, 255, bg_alpha))
+        painter.setBrush(QColor(255, 255, 255, 36))
         painter.drawEllipse(rect)
 
         cx = rect.x() + rect.width() / 2
         cy = rect.y() + rect.height() / 2
         r = (rect.width() / 2) - 5
 
-        # Stroke + arrowhead alpha
-        stroke_alpha = 90 if pending else 230
-        spin = self._anim_phase if pending else 0.0
+        stroke_alpha = 230
+        spin = 0.0
         pen = QPen(QColor(230, 230, 240, stroke_alpha))
         pen.setWidth(2)
         pen.setCapStyle(Qt.RoundCap)
@@ -820,6 +864,78 @@ class MeterWidget(QWidget):
         painter.setBrush(Qt.NoBrush)
         painter.drawEllipse(inner)
 
+        # Two-line timestamp drawn INSIDE the dot so the user can read both
+        # "when did this data last refresh" and "when does the 5h window
+        # reset" without expanding the meter. Top line = last refresh time
+        # (white), bottom line = 5h reset time (cyan, slightly dimmer so it
+        # reads as secondary info). Both small monospace on a dark pill so
+        # they stay legible regardless of the urgency fill underneath.
+        from datetime import datetime, timezone
+        ref_str = None
+        cap = (self._official or {}).get("captured_at") if self._official else None
+        if cap:
+            try:
+                ts = datetime.fromisoformat(str(cap).replace("Z", "+00:00"))
+                ref_str = ts.astimezone().strftime("%H:%M")
+            except Exception:
+                ref_str = None
+        # Bottom line: time remaining until the 5h window resets — more
+        # obvious than a wall-clock time ("2h7m" vs "21:20").
+        reset_str = None
+        dot_official = self._last_good_official or self._official
+        if dot_official:
+            rl = (dot_official or {}).get("rate_limits") or {}
+            block = rl.get("five_hour") or {}
+            rts = block.get("resets_at")
+            if rts is not None:
+                try:
+                    if isinstance(rts, (int, float)):
+                        reset_dt = datetime.fromtimestamp(rts, tz=timezone.utc)
+                    else:
+                        reset_dt = datetime.fromisoformat(str(rts).replace("Z", "+00:00"))
+                    secs_left = max(0, int((reset_dt - datetime.now(timezone.utc)).total_seconds()))
+                    if secs_left < 60:
+                        reset_str = f"{secs_left}s"
+                    elif secs_left < 3600:
+                        reset_str = f"{secs_left // 60}m"
+                    else:
+                        h = secs_left // 3600
+                        m = (secs_left % 3600) // 60
+                        reset_str = f"{h}h{m}m" if m else f"{h}h"
+                except Exception:
+                    reset_str = None
+
+        if ref_str or reset_str:
+            font = QFont("Menlo")
+            font.setPointSize(8)
+            font.setBold(True)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            line_h = fm.ascent() + 1
+            widths = [fm.horizontalAdvance(s) for s in (ref_str, reset_str) if s]
+            text_w = max(widths)
+            n_lines = sum(1 for s in (ref_str, reset_str) if s)
+            pad_x, pad_y = 4, 2
+            pill_w = text_w + pad_x * 2
+            pill_h = line_h * n_lines + pad_y * 2
+            cx_dot = inner.x() + inner.width() / 2
+            cy_dot = inner.y() + inner.height() / 2
+            px = int(cx_dot - pill_w / 2)
+            py = int(cy_dot - pill_h / 2)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 215))
+            painter.drawRoundedRect(px, py, pill_w, pill_h, 5, 5)
+            y_cursor = py + pad_y + fm.ascent()
+            if ref_str:
+                painter.setPen(QColor(235, 240, 255, 245))  # white-ish — primary
+                rw = fm.horizontalAdvance(ref_str)
+                painter.drawText(int(cx_dot - rw / 2), int(y_cursor), ref_str)
+                y_cursor += line_h
+            if reset_str:
+                painter.setPen(QColor(110, 220, 255, 230))  # neon cyan — secondary
+                rw = fm.horizontalAdvance(reset_str)
+                painter.drawText(int(cx_dot - rw / 2), int(y_cursor), reset_str)
+
     def _draw_waiting_state(self, painter):
         """Render when no live rate-limit data is available.
 
@@ -827,19 +943,21 @@ class MeterWidget(QWidget):
         No estimates, no guessed numbers — the user asked for real data only.
         """
         cx = self.SIDE_PANEL + self.SIZE / 2
-        cy = self.SIZE / 2
+        cy = self.SIZE / 2 + self.RING_TOP_OFFSET
 
         outer_inset = 14
         outer_diam = self.SIZE - 2 * outer_inset
+        outer_top = outer_inset + self.RING_TOP_OFFSET
         inner_inset = outer_inset + self.BASE_RING_THICKNESS + self.RING_GAP
         inner_diam = self.SIZE - 2 * inner_inset
+        inner_top = inner_inset + self.RING_TOP_OFFSET
 
         # Two faint ring outlines + a slow synthwave-cyan sweep so the
         # waiting state feels alive, not broken
         ox = self.SIDE_PANEL
         for idx, (rect_tuple, thickness) in enumerate([
-            ((ox + outer_inset, outer_inset, outer_diam, outer_diam), self.BASE_RING_THICKNESS),
-            ((ox + inner_inset, inner_inset, inner_diam, inner_diam), self.BASE_RING_THICKNESS),
+            ((ox + outer_inset, outer_top, outer_diam, outer_diam), self.BASE_RING_THICKNESS),
+            ((ox + inner_inset, inner_top, inner_diam, inner_diam), self.BASE_RING_THICKNESS),
         ]):
             x, y, w, h = rect_tuple
             pen = QPen(QColor(255, 255, 255, 20))
@@ -906,36 +1024,6 @@ class MeterWidget(QWidget):
         if key == "five_hour" and same_day:
             return f"resets {time_part}"
         return f"resets {local.strftime('%a')} {time_part}"
-
-    def _time_until_reset(self, key: str) -> str:
-        """Compute 'time until window resets' from resets_at timestamp."""
-        from datetime import datetime, timezone
-        rl = (self._official or {}).get("rate_limits") or {}
-        block = rl.get(key) or {}
-        ts = block.get("resets_at")
-        if ts is None:
-            return "—"
-        # Can be unix seconds (int) or ISO8601 string
-        try:
-            if isinstance(ts, (int, float)):
-                reset_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            else:
-                reset_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-        except Exception:
-            return "—"
-        delta = reset_dt - datetime.now(timezone.utc)
-        secs = int(delta.total_seconds())
-        if secs <= 0:
-            return "now"
-        if secs < 3600:
-            return f"{secs // 60}m"
-        if secs < 86400:
-            h = secs // 3600
-            m = (secs % 3600) // 60
-            return f"{h}h {m}m" if m else f"{h}h"
-        d = secs // 86400
-        h = (secs % 86400) // 3600
-        return f"{d}d {h}h" if h else f"{d}d"
 
     def _draw_side_panel(self, painter, frac5, fracw, delta5, deltaw):
         """Left-side info panel: slider-style horizontal lines, one per dim.
@@ -1064,6 +1152,26 @@ class MeterWidget(QWidget):
                 dim.setAlpha(170)
                 painter.setPen(dim)
                 painter.drawText(int(track_left), int(y_track + 16), reset_text)
+
+        # Bottom-of-panel "refreshed at" tick. Always shown when we have
+        # data, so a successful auto-refresh leaves a visible footprint
+        # (rings often don't change perceptibly when usage is low). The
+        # captured_at value is local-time HH:MM:SS — easy to eyeball
+        # against the wall clock to verify the auto-refresh fired.
+        cap = (self._official or {}).get("captured_at") if self._official else None
+        if cap:
+            from datetime import datetime, timezone
+            try:
+                ts = datetime.fromisoformat(str(cap).replace("Z", "+00:00"))
+                local_str = ts.astimezone().strftime("ref %H:%M:%S")
+            except Exception:
+                local_str = None
+            if local_str:
+                tick_font = QFont("Helvetica Neue")
+                tick_font.setPointSize(8)
+                painter.setFont(tick_font)
+                painter.setPen(QColor(200, 200, 215, 150))
+                painter.drawText(x_lbl, self.HEIGHT - 10, local_str)
 
     def _draw_pair_icon(self, painter, kind: str, x: int, y: int, color: QColor) -> None:
         """Tiny glyph in place of a row label. kind ∈ {"clock", "calendar"}."""
@@ -1232,25 +1340,6 @@ class MeterWidget(QWidget):
                 int(overflow_span_deg * 16),
             )
 
-    def _time_until_cap(self, stats, ceiling: int, burn_tpm: float) -> str:
-        """How long until we hit the ceiling at current burn rate.
-
-        Returns a short string like "1h 12m" or "8m" or "—" for idle.
-        """
-        remaining = max(ceiling - stats.billed_tokens, 0)
-        if burn_tpm <= 0 or remaining <= 0:
-            return "—"
-        minutes = remaining / burn_tpm
-        if minutes < 1:
-            return "<1m"
-        if minutes < 60:
-            return f"{int(round(minutes))}m"
-        h = int(minutes // 60)
-        m = int(round(minutes % 60))
-        if m == 0:
-            return f"{h}h"
-        return f"{h}h {m}m"
-
     def _window_time_left(self, stats, window_hours: float) -> str:
         """Time remaining until the window resets, per Anthropic's own clock.
 
@@ -1319,7 +1408,7 @@ class MeterWidget(QWidget):
 
     def _draw_center_text(self, painter, frac5, fracw, delta5, deltaw):
         cx = self.SIDE_PANEL + self.SIZE / 2
-        cy = self.SIZE / 2
+        cy = self.SIZE / 2 + self.RING_TOP_OFFSET
 
         color5 = self._verdict_color(delta5, "5h")
 
@@ -1369,7 +1458,7 @@ class MeterWidget(QWidget):
         # numbers aren't live. The hook only fires from terminal Claude
         # sessions, so VSCode-only work drifts.
         stale_secs = self._data_age_seconds()
-        if stale_secs is not None and stale_secs > 90:
+        if stale_secs is not None and stale_secs > 150:  # 2.5× AUTO_REFRESH_SECONDS
             mins = int(stale_secs // 60)
             stale_text = f"stale {mins}m" if mins >= 1 else f"stale {int(stale_secs)}s"
             stale_font = QFont("Helvetica Neue")
