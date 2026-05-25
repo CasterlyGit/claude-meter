@@ -21,4 +21,9 @@ export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 # trust scope a human would grant) and then keep stdin open with `cat` so
 # claude doesn't see EOF and exit. Trust scope here is identical to clicking
 # "Yes" yourself — no additional permission bypass.
-exec /usr/bin/script -q -F /dev/null /usr/local/bin/claude < <(printf '\n'; cat) >/tmp/claude-tty-keepalive.log 2>&1
+# Send an initial newline (dismiss trust dialog), then send "ok" every
+# 3 minutes to trigger an API call so the statusline gets fresh rate-limit
+# headers — critical after a 5h window reset when the pty has old data.
+exec /usr/bin/script -q -F /dev/null /usr/local/bin/claude \
+  < <(printf '\n'; sleep 8; while true; do printf 'ok\r'; sleep 180; done) \
+  >/tmp/claude-tty-keepalive.log 2>&1

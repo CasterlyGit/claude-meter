@@ -4,7 +4,7 @@
 
 A tiny always-on-top dashboard that keeps your Claude Code rate-limit windows in the corner of your eye. Two concentric rings — 5-hour outside, weekly inside — synthwave palette, every visual property doing real work. No labels cluttering the widget, no estimates: it reads the same numbers Claude Code's own `/usage` panel pulls from Anthropic.
 
-**Status:** v0.3 — wall-clock reset times on the left panel, `ON PACE` promoted to the center of the rings, collapsed view is now a fill-from-bottom progress pillar (not an Apple-style ring), and a 10-minute self-refresh keeps the numbers live without you clicking anything.
+**Status:** v0.5 — data stays live across 5h window resets; keepalive now sends periodic "ok" prompts so the Claude Code statusline gets fresh API headers after a window rolls over; fixed `pty.openpty()` import that silently broke the meter's internal pty spawner.
 
 ## What the rings actually say
 

@@ -6,7 +6,7 @@
     <string>com.casterly.claude-meter</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/casterly/Documents/Dev/claude-meter/.venv/bin/claude-meter</string>
+        <string>/Users/casterly/.local/share/claude-meter/venv/bin/claude-meter</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

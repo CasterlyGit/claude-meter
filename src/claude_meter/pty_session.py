@@ -23,6 +23,7 @@ import pty
 import select
 import shutil
 import signal
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -50,6 +51,7 @@ class PtySession:
         self._model = model
         self._pid: Optional[int] = None
         self._master_fd: Optional[int] = None
+        self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._drain_thread: Optional[threading.Thread] = None
         self._stop_drain = threading.Event()
@@ -65,7 +67,13 @@ class PtySession:
         return True
 
     def spawn(self) -> bool:
-        """Start the headless claude TUI. Returns True on success."""
+        """Start the headless claude TUI. Returns True on success.
+
+        Uses pty.openpty() + subprocess.Popen instead of pty.fork() because
+        pty.fork() calls fork() directly inside a Cocoa/Qt GUI process, which
+        is unsafe on macOS (Cocoa is not fork-safe). Popen goes through
+        _posixsubprocess which handles signal-handler resets and is safe.
+        """
         if self.is_alive():
             return True
 
@@ -74,25 +82,36 @@ class PtySession:
             return False
 
         try:
-            pid, fd = pty.fork()
+            master_fd, slave_fd = pty.openpty()
         except Exception:
             return False
 
-        if pid == 0:
-            # Child: set up environment so claude renders cleanly in a pty
-            # with reasonable terminal capabilities, then exec.
-            os.environ["TERM"] = "xterm-256color"
-            os.environ["COLUMNS"] = "120"
-            os.environ["LINES"] = "40"
-            os.environ["CLAUDE_CODE_INTERNAL_REFRESH"] = "1"  # marker for our hook to log
-            try:
-                os.execv(binary, [binary, "--model", self._model])
-            except Exception:
-                os._exit(127)
+        env = os.environ.copy()
+        env["TERM"] = "xterm-256color"
+        env["COLUMNS"] = "120"
+        env["LINES"] = "40"
+        env["CLAUDE_CODE_INTERNAL_REFRESH"] = "1"
 
-        # Parent
-        self._pid = pid
-        self._master_fd = fd
+        try:
+            proc = subprocess.Popen(
+                [binary, "--model", self._model],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=env,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except Exception:
+            os.close(master_fd)
+            os.close(slave_fd)
+            return False
+
+        # Parent owns master; slave is the child's terminal — close our copy.
+        os.close(slave_fd)
+
+        self._pid = proc.pid
+        self._master_fd = master_fd
 
         # Drain output in the background so the pty buffer doesn't fill up
         # and block the child.
@@ -107,18 +126,12 @@ class PtySession:
         time.sleep(6.0)
 
         # Newer Claude Code versions open with a "Is this a project you
-        # trust?" dialog the first time they see a given cwd. The default
-        # selection is "Yes, I trust this folder" — pressing Enter accepts
-        # it, which is exactly what a human would do when they spawned this
-        # TUI to look at the rate-limit numbers. Without this, the TUI sits
-        # on the dialog forever and the statusline never fires, so refresh
-        # clicks accomplish nothing. We send a couple of carriage returns
-        # spaced out: harmless no-ops in chat (just empty submits) if no
-        # dialog is present, dismisses the dialog if it is.
+        # trust?" dialog the first time they see a given cwd. Pressing Enter
+        # accepts it; harmless no-ops in chat if no dialog is present.
         try:
-            os.write(fd, b"\r")
+            os.write(master_fd, b"\r")
             time.sleep(0.8)
-            os.write(fd, b"\r")
+            os.write(master_fd, b"\r")
         except OSError:
             pass
 

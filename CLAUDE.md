@@ -1,5 +1,5 @@
 # claude-meter
-Floating PyQt5 HUD that shows Claude Code's 5h and 7-day token rate-limit rings in real time. Status: v0.3, stable.
+Floating PyQt5 HUD that shows Claude Code's 5h and 7-day token rate-limit rings in real time. Status: v0.5, stable.
 
 ## Key files
 - `src/claude_meter/window.py` — the entire UI: `MeterWidget` (QWidget), all paint logic, timers, drag/collapse/refresh
@@ -21,6 +21,17 @@ Floating PyQt5 HUD that shows Claude Code's 5h and 7-day token rate-limit rings 
 - Position persisted to `~/.claude/state/claude-meter-position.json`
 - `BURN_FULL_TPM = 50_000` tokens/min = full comet. Stale warning shown if `captured_at` age > 150s
 
+## Debugging — check state FIRST, code second
+When "is X updating/working/showing?":
+1. `tail -50 /tmp/claude-meter.log` — what is the app doing?
+2. `cat ~/.claude/state/rate-limits.json` — what data does it see?
+3. `pgrep -fl claude_meter` — is it running?
+4. Only read source if the above are inconclusive.
+
+All UI interactions must snap (collapse, expand, drag). Slow work (pty spawn, disk IO) runs on background threads — never block the Qt main thread. Do NOT show loading spinners for auto-fired background refreshes; only for explicit user-initiated long actions.
+
+After any UI change: launch the app, exercise the feature, verify visually before calling it done.
+
 ## Run / test
 ```bash
 cd /Users/casterly/Documents/Dev/claude-meter
@@ -33,3 +44,5 @@ No automated test suite. UI tested visually.
 - `_last_good_official` caches the last valid data so rings don't blank during pty refresh
 - `mac_window.py` is the only file not in `__main__` imports — do not remove it
 - Do NOT add skip-if-fresh logic to `_auto_refresh_tick`; that was explicitly reverted (#14)
+- `keepalive` sends `ok\r` every 180s so claude gets fresh API headers after a 5h window reset; without this the EXPIRED guard blocks all writes and data goes stale indefinitely
+- `import pty` must stay in pty_session.py — `pty.openpty()` is used in `spawn()` even though process launch uses `subprocess.Popen`
