@@ -12,6 +12,16 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- Only load inside a real Aqua GUI session. Without this, launchd can
+         start the Qt app before the window server / login session is ready at
+         boot; the process then exits immediately (no display to draw to) and
+         KeepAlive respawns it in a tight loop — a contributor to the "broken
+         after reboot" symptom. Aqua = a logged-in graphical session. -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <!-- Background ThrottleInterval so a respawn loop can't hammer the CPU. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
     <key>StandardOutPath</key>
     <string>/tmp/claude-meter.log</string>
     <key>StandardErrorPath</key>
