@@ -1,14 +1,20 @@
 # claude-meter
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-cyan.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776ab.svg)](https://www.python.org/)
+[![PyQt5](https://img.shields.io/badge/UI-PyQt5-41cd52.svg)](https://pypi.org/project/PyQt5/)
+
+**Always-on-top macOS HUD that shows your Claude Code 5-hour and weekly token budget as two concentric rings — every visual property carrying real signal, no labels, no estimates.**
+
+**Status:** v0.5 — stable; data stays live across 5h window resets; 2-minute self-refresh via headless pty keepalive; monotonic guard prevents stale-session writes from overwriting fresher data.
+
 [Live demo →](https://casterlygit.github.io/claude-meter/)
 
-A tiny always-on-top dashboard that keeps your Claude Code rate-limit windows in the corner of your eye. Two concentric rings — 5-hour outside, weekly inside — synthwave palette, every visual property doing real work. No labels cluttering the widget, no estimates: it reads the same numbers Claude Code's own `/usage` panel pulls from Anthropic.
-
-**Status:** v0.5 — data stays live across 5h window resets; keepalive now sends periodic "ok" prompts so the Claude Code statusline gets fresh API headers after a window rolls over; fixed `pty.openpty()` import that silently broke the meter's internal pty spawner.
+---
 
 ## What the rings actually say
 
-Every visual property carries information:
+Every visual property carries information — nothing is decorative:
 
 | What you see | What it means |
 |---|---|
@@ -16,40 +22,60 @@ Every visual property carries information:
 | **Hue family** | Outer = 5h (cyan → coral → magenta). Inner = weekly (lime → amber → red-orange) |
 | **Hue tier** | Calm / warning / danger — shifts at 65% and 85% |
 | **Pace tick on the track** | Where you'd be at linear pace. Arc past the tick = burning hot |
-| **Comet tail (outer ring)** | Length is proportional to your tokens-per-minute over the last 5 minutes |
+| **Comet tail (outer ring)** | Length is proportional to your tokens-per-minute over the last 5 minutes; full tail = 50k tpm |
 | **Dashed overflow** | Past 100%, arc continues dashed into a second lap |
-| **Center stack** | `NN% USED` / `ON PACE` / `4h 43m` — same color, three weight tiers, verdict in the middle |
+| **Center stack** | `NN% USED` / `ON PACE` / `4h 43m` — same hue, three weight tiers, verdict in the middle |
 | **Pills inside each ring** | The literal % for that window, color-matched, near the bottom of the ring |
-| **Side panel (left)** | Two rails (5h, weekly) with the colored fill + a white tick for pace; under each rail the wall-clock reset time (`resets 11:43 pm`, `resets Sun 11:43 pm`) so you know *when*, not just *how long* |
+| **Side panel (left)** | Two rails (5h, weekly) with colored fill + white tick for pace; under each rail the wall-clock reset time (`resets 11:43 pm`, `resets Sun 11:43 pm`) — when, not how long |
 
 ## Why this exists
 
-Anthropic doesn't expose your 5-hour / weekly quota as a queryable API. The Claude Code app shows the gauge when you click into it; the desktop app and VS Code extension don't write it anywhere external processes can read. claude-meter pulls it from the statusline hook (the one path Anthropic does expose) and pins it where you can glance at it.
+Anthropic doesn't expose your 5-hour / weekly quota as a queryable API. The Claude Code app shows the gauge when you click into it; the desktop app and VS Code extension don't write it anywhere external processes can read. claude-meter pulls it from the statusline hook — the one path Anthropic does expose — and pins it where you can glance at it.
 
-The whole reason this exists: knowing how much of your 5h window is left changes how you plan a session. If you're at 70% with 90 minutes to go, you slow down. If you're at 12% with 30 minutes left, you push.
+Knowing how much of your 5h window is left changes how you plan a session. At 70% with 90 minutes to go, you slow down. At 12% with 30 minutes left, you push.
 
-## Getting it out of the way
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Claude Code
+        A[statusline hook\ncapture-rate-limits.sh]
+    end
+    subgraph claude-meter
+        B[counter.py\nreads .jsonl + rate-limits.json]
+        C[pty_session.py\nheadless claude TUI]
+        D[window.py\nMeterWidget QWidget\n5 s data timer · 20 fps anim]
+        E[mac_window.py\nNSStatusWindowLevel pin]
+    end
+    subgraph Data files
+        F[~/.claude/state/rate-limits.json]
+        G[~/.claude/projects/**/*.jsonl]
+    end
+
+    A -->|writes| F
+    C -->|sends ok prompt → fires statusline| A
+    F -->|read_official_rate_limits| B
+    G -->|token aggregation| B
+    B --> D
+    D -->|PyObjC always-on-top| E
+```
+
+**Data flow in detail:**
+
+- `capture-rate-limits.sh` is registered as Claude Code's `statusLine` hook; it fires every 30s and writes `~/.claude/state/rate-limits.json` with the raw Anthropic rate-limit payload.
+- `counter.py` reads that file (authoritative: same `used_percentage` + `resets_at` the in-app gauge shows) and the transcript `.jsonl` files for burn-rate and comet-tail calculation.
+- `pty_session.py` owns a persistent headless `claude` TUI in a pseudo-terminal. The refresh button sends a single `ok\r` prompt (~0.5¢ Haiku), causing the TUI to re-render and fire the statusline hook. A background keepalive sends the same prompt every 2 minutes so data stays live even when the TUI is otherwise idle.
+- `MeterWidget` runs four timers: `_data_timer` (5s reads data), `_pin_timer` (2s pins window level), `_auto_refresh_timer` (120s fires unconditional pty refresh), `_anim_timer` (50ms / 20fps for comet + pace pulse).
+- The monotonic guard in `capture-rate-limits.sh` rejects writes that would lower the recorded percentage within the same 5h window — multiple concurrent `claude` sessions race on this file, and only the highest reading wins until `resets_at` advances.
+
+## Getting out of the way
 
 The widget pins to the top-right of your rightmost monitor — right where macOS menu-bar dropdowns and Spotlight render. So:
 
-- **Click the chevron** (top-right of the widget) → collapses to a small **progress pillar**: a dark circle that fills bottom-up by your 5-hour percentage, framed in the urgency color. Climbs visibly as you spend, so the collapsed view is enough on its own — no need to re-expand to know where you are.
+- **Click the chevron** (top-right of the widget) → collapses to a **42px progress pillar**: a dark circle that fills bottom-up by your 5-hour percentage, framed in the urgency color.
 - **Click the pillar** → expands back to the full meter.
 
-42px when collapsed. Plenty of room for menu items, Spotlight, notification flyouts.
-
-## Refresh — automatic every 10 min, or click for an instant one
-
-The numbers only update when *something* makes a Claude API call (a terminal `claude` rendering its statusline, the desktop Claude.app, or the VS Code extension). If you're working in the apps but not the terminal, the file freezes.
-
-The meter fixes that itself: a background timer fires a refresh every `AUTO_REFRESH_SECONDS` (default 600s = 10 min), and *only* when the captured data is actually stale — if a real interactive session is keeping the statusline warm, the timer rides along for free and spends nothing. So the collapsed pillar keeps climbing whether you've expanded the widget or not.
-
-For instant updates: **click the circular-arrow button** (left of the chevron). The meter owns a hidden, headless `claude` TUI running inside a pseudo-terminal — no visible window, no dock icon — and the click sends one tiny prompt to it. The TUI re-renders, the statusline hook writes fresh numbers, the meter picks them up within a few seconds. First click after a meter restart cold-boots the TUI (~5–8s). Every subsequent click is fast (~1–2s) because the TUI stays warm in the background.
-
-Cost: roughly half a cent of Haiku tokens per click. Tiny against any 5h budget.
-
-Guards:
-- The button is **disabled while one refresh is already in flight** — can't double-spend.
-- The capture script enforces a **monotonic guard** on the rate-limits file: within a single 5h window, writes that would *lower* the recorded percentage are rejected as stale per-session echoes (multiple claude sessions can race on the same file; only the highest reading wins until window reset). When the window genuinely rolls over (`resets_at` advances), the lower value is accepted as the new baseline.
+The collapsed view is enough on its own — the pillar climbs visibly as you spend.
 
 ## Setup
 
@@ -66,7 +92,7 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-Register the statusline by adding this to `~/.claude/settings.json`:
+Register the statusline hook in `~/.claude/settings.json`:
 
 ```json
 {
@@ -86,9 +112,29 @@ Restart any active `claude` TUI sessions. The first time it fires it writes `~/.
 claude-meter
 ```
 
-## Where the numbers come from (the honest version)
+## Auto-start at login
 
-The fields are real and structured:
+```bash
+cp scripts/com.casterly.claude-meter.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.casterly.claude-meter.plist
+```
+
+## Config
+
+`src/claude_meter/config.py`:
+
+| Key | Default | Effect |
+|---|---|---|
+| `ACTIVE_PLAN` | `"max-20x"` | Sets token ceilings; options: `"pro"`, `"max-5x"`, `"max-20x"`, `"console"` |
+| `WARN_THRESHOLD` | `0.65` | Hue shifts from calm to warning at this fraction |
+| `DANGER_THRESHOLD` | `0.85` | Hue shifts to danger at this fraction |
+| `REFRESH_SECONDS` | `5` | How often the widget re-reads the rate-limit file |
+| `AUTO_REFRESH_SECONDS` | `120` | How often the pty keepalive fires when data is stale |
+| `BURN_FULL_TPM` | `50 000` | Tokens/min that fills the comet tail to maximum arc |
+
+## Where the numbers come from
+
+The fields are real and structured — straight from Anthropic:
 
 ```json
 {
@@ -99,28 +145,19 @@ The fields are real and structured:
 }
 ```
 
-Both `used_percentage` and `resets_at` come straight from Anthropic — the time-left readout uses `resets_at` as the source of truth, not a guess from your transcript timestamps. The 5h window is a fixed slot with a hard reset, not a rolling-from-first-use window, and the meter respects that.
+`used_percentage` and `resets_at` come directly from Anthropic's API response headers via the Claude Code statusline hook. The time-left readout uses `resets_at` as the source of truth — not a guess from transcript timestamps. If no live data is available, the rings stay empty and the center shows "no live data."
 
-If no live data is available, the rings stay empty and the center shows "no live data." No estimates, no guessed ceilings.
+**Note:** The statusline hook only fires inside interactive terminal `claude` sessions — not the VS Code extension, not the desktop Claude.app. Either keep a terminal session active, or use the refresh button.
 
-**The statusline only fires inside interactive terminal sessions** — not the VS Code extension, not the desktop Claude.app. Either keep a terminal `claude` session active, or use the refresh button when you want a fresh read.
+## Observability
 
-## Auto-start at login
+The meter writes a log at `/tmp/claude-meter.log`. Quick diagnosis:
 
 ```bash
-cp scripts/com.casterly.claude-meter.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.casterly.claude-meter.plist
+tail -50 /tmp/claude-meter.log          # what is the app doing?
+cat ~/.claude/state/rate-limits.json    # what data does it see?
+pgrep -fl claude_meter                  # is it running?
 ```
-
-## Configuration
-
-`src/claude_meter/config.py`:
-
-- `ACTIVE_PLAN` — `"pro"`, `"max-5x"`, `"max-20x"`, or `"console"`
-- `WARN_THRESHOLD` / `DANGER_THRESHOLD` — fraction at which the rings shift hue tier
-- `REFRESH_SECONDS` — how often the meter re-reads the captured rate-limit file (default 5s)
-- `AUTO_REFRESH_SECONDS` — how often the meter fires its own statusline refresh when the file has gone stale (default 600s = 10 min)
-- `BURN_FULL_TAIL_TPM` in `window.py` — what tokens/min counts as a "full comet tail"
 
 ## Project layout
 
@@ -128,9 +165,9 @@ launchctl load ~/Library/LaunchAgents/com.casterly.claude-meter.plist
 src/claude_meter/
 ├── counter.py        # reads ~/.claude/projects/**/*.jsonl, aggregates usage
 ├── config.py         # plan ceilings + thresholds
-├── mac_window.py     # NSWindow pinning shim
+├── mac_window.py     # NSWindow pinning shim (PyObjC, darwin-only)
 ├── pty_session.py    # persistent headless claude TUI for the refresh button
-├── window.py         # the Qt widget with all the ring drawing logic
+├── window.py         # the Qt widget with all ring drawing logic
 └── __main__.py       # entry point
 scripts/
 ├── capture-rate-limits.sh           # statusline hook with monotonic guard
@@ -143,7 +180,18 @@ scripts/
 - [x] v0.2 — refresh button, collapse-to-dot, `resets_at`-based time, per-ring % pills, weight-graded center stack
 - [x] v0.2.1 — refresh button uses a headless pty so it actually works (no popup terminal); monotonic guard prevents stale per-session writes from flicker-overwriting fresh data
 - [x] v0.3 — wall-clock reset times in the side panel; verdict promoted to the center of the rings; collapsed view is a fill-from-bottom progress pillar instead of a static colored dot; 10-min self-refresh so the numbers stay live without a click
+- [x] v0.5 — 2-min keepalive replaces 10-min; `_last_good_official` cache prevents rings from blanking during pty refresh; stale-warning at 150s
 - [ ] Optional `ANTHROPIC_API_KEY` mode — one tiny ping/minute reads the rate-limit headers off the response. Costs roughly nothing in tokens, no terminal session needed. ([#1](https://github.com/CasterlyGit/claude-meter/issues/1))
 - [ ] Multi-monitor positioning preference (currently pins to rightmost; some setups want primary)
 - [ ] Linux support — the rings draw fine on PyQt5, but the always-on-top pin uses PyObjC which is darwin-only
 - [ ] curby integration — meter overlays a tiny status puck when curby is running
+
+## Related projects
+
+- [shed](https://github.com/CasterlyGit/shed) — the Claude Code agent that learns your workflow; claude-meter is the budget gauge you watch while shed runs
+- [curby](https://github.com/CasterlyGit/curby) — voice + gesture macOS controller; planned integration with claude-meter for a status puck overlay
+- [curby-jarvis](https://github.com/CasterlyGit/curby-jarvis) — Hybrid CapabilityRouter voice controller built on top of curby
+
+## License
+
+MIT — see [LICENSE](LICENSE).
