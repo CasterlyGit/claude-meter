@@ -89,6 +89,7 @@ class MeterWidget(QWidget):
         self._refresh_pending:      bool = False
         self._refresh_baseline_ts:  str | None = None
         self._refresh_recycled:     bool = False
+        self._refresh_pending_since: float = 0.0   # monotonic; watchdog stuck-detect
 
         # Drag state
         self._drag_origin: QPoint | None = None
@@ -146,24 +147,43 @@ class MeterWidget(QWidget):
                     self._refresh_pending = False
                     self._refresh_baseline_ts = None
                     self._refresh_recycled = False
+                    self._refresh_pending_since = 0.0
         self.update()
 
     def _auto_refresh_tick(self) -> None:
         """Always fire a pty call — captured_at updates every 30 s even when
         rate-limit VALUES haven't changed, so age-gating gives false freshness."""
+        import time
         from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
         if self._refresh_pending:
-            print(f"[{ts}] auto-refresh tick: skip (in-flight)", file=sys.stderr, flush=True)
-            return
+            # WATCHDOG. If "in-flight" has outlived the 130s give-up timer plus
+            # margin, the singleShot meant to clear it never ran — the process
+            # was suspended across a reboot / display-sleep, so the flag is
+            # stuck and every tick logs "skip (in-flight)" forever. That is the
+            # bug that froze the meter after a restart. Force-clear so the loop
+            # self-heals on the very next tick instead of needing a manual fix.
+            if self._refresh_pending_since and (
+                time.monotonic() - self._refresh_pending_since > 150
+            ):
+                print(f"[{ts}] auto-refresh tick: WATCHDOG force-clear (stuck in-flight)",
+                      file=sys.stderr, flush=True)
+                self._refresh_pending = False
+                self._refresh_recycled = False
+                self._refresh_pending_since = 0.0
+            else:
+                print(f"[{ts}] auto-refresh tick: skip (in-flight)", file=sys.stderr, flush=True)
+                return
         print(f"[{ts}] auto-refresh tick: FIRING", file=sys.stderr, flush=True)
         self._run_refresh()
 
     def _run_refresh(self) -> None:
         if self._refresh_pending:
             return
+        import time
         self._refresh_pending = True
         self._refresh_recycled = False
+        self._refresh_pending_since = time.monotonic()
         self._refresh_baseline_ts = (self._official or {}).get("captured_at") if self._official else None
         for ms in (800, 1600, 2400, 3200, 4500, 6000, 8000, 11000, 14000):
             QTimer.singleShot(ms, self._refresh_data)
@@ -203,6 +223,7 @@ class MeterWidget(QWidget):
             self._refresh_pending = False
             self._refresh_baseline_ts = None
             self._refresh_recycled = False
+            self._refresh_pending_since = 0.0
             self.update()
 
     # ── Data (all disk I/O runs on a daemon thread) ───────────────────────────

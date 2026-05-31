@@ -128,10 +128,19 @@ class PtySession:
         # Newer Claude Code versions open with a "Is this a project you
         # trust?" dialog the first time they see a given cwd. Pressing Enter
         # accepts it; harmless no-ops in chat if no dialog is present.
+        # CC 2.1.x then sits on a "bypass permissions" startup banner where a
+        # bare CR sent immediately after typing does NOT submit the text as a
+        # message (the turn stalls at "Moseying… 0/4"). So we dismiss the
+        # dialog, then type the prompt and send CR on its own beat so the TUI
+        # registers Enter-to-submit and a real API call fires.
         try:
-            os.write(master_fd, b"\r")
-            time.sleep(0.8)
-            os.write(master_fd, b"\r")
+            os.write(master_fd, b"\r")        # dismiss trust dialog
+            time.sleep(1.0)
+            os.write(master_fd, b"\r")        # dismiss any second screen
+            time.sleep(1.0)
+            os.write(master_fd, b"ok")        # type prompt
+            time.sleep(0.6)
+            os.write(master_fd, b"\r")         # submit on its own beat
         except OSError:
             pass
 

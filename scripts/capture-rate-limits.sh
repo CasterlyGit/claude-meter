@@ -60,13 +60,25 @@ if [ "$HAS_RL" = "true" ]; then
   fi
 
   if [ "$ACCEPT" = "1" ]; then
-    echo "$INPUT" | jq --arg ts "$TS" '{
+    # ATOMIC WRITE. Multiple concurrent claude sessions fire this hook at
+    # once; a plain `jq > "$RL_PATH"` truncates then streams, so two writers
+    # interleave into one malformed file (JSONDecodeError: Extra data). The
+    # meter then can't parse it and shows stale data forever — this was the
+    # real cause of the "stale after reboot" bug. Write to a per-PID temp,
+    # then rename: rename is atomic, so a reader sees only old-whole or
+    # new-whole, never a half-written mix.
+    TMP="$RL_PATH.$$.tmp"
+    if echo "$INPUT" | jq --arg ts "$TS" '{
       captured_at: $ts,
       rate_limits: .rate_limits,
       model: .model,
       cost: .cost,
       context_window: .context_window
-    }' > "$RL_PATH" 2>/dev/null
+    }' > "$TMP" 2>/dev/null && [ -s "$TMP" ]; then
+      mv -f "$TMP" "$RL_PATH"
+    else
+      rm -f "$TMP"
+    fi
   fi
 fi
 

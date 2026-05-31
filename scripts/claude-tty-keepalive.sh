@@ -24,6 +24,13 @@ export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 # Send an initial newline (dismiss trust dialog), then send "ok" every
 # 3 minutes to trigger an API call so the statusline gets fresh rate-limit
 # headers — critical after a 5h window reset when the pty has old data.
+# CC 2.1.x opens on a startup screen (trust dialog / "bypass permissions"
+# banner) where a bare CR does NOT submit the typed text as a message — the
+# turn stalls ("Moseying… 0/4") and the statusline never gets fresh
+# rate-limit headers, so rate-limits.json freezes. Fix: after the boot grace
+# period, type the prompt characters, pause, THEN send CR on its own so the
+# TUI registers it as Enter-to-submit. Repeat every 180s.
 exec /usr/bin/script -q -F /dev/null /usr/local/bin/claude \
-  < <(printf '\n'; sleep 8; while true; do printf 'ok\r'; sleep 180; done) \
+  < <(sleep 10; printf '\r'; sleep 2; \
+      while true; do printf 'ok'; sleep 1; printf '\r'; sleep 180; done) \
   >/tmp/claude-tty-keepalive.log 2>&1
